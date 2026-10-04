@@ -12,14 +12,14 @@
 @font-face { font-family: 'Material Symbols Rounded'; font-style: normal; font-weight: 200 500; font-display: block; src: url('./assets/fonts/material-symbols-rounded.woff2') format('woff2'); }
 
 html, body, #root { margin: 0; height: 100%; }
-html, body { background: #0e0e0f; color: #ededee; font-family: 'Onest', system-ui, sans-serif; -webkit-font-smoothing: antialiased; overflow: hidden; user-select: none; }
-a { color: #cfcfd3 } a:hover { color: #fff }
+html, body { background: var(--g-0e0e0f, #0e0e0f); color: var(--g-ededee, #ededee); font-family: 'Onest', system-ui, sans-serif; -webkit-font-smoothing: antialiased; overflow: hidden; user-select: none; }
+a { color: var(--g-cfcfd3, #cfcfd3) } a:hover { color: var(--g-ffffff, #fff) }
 * { box-sizing: border-box }
-::-webkit-scrollbar { width: 8px; height: 8px } ::-webkit-scrollbar-thumb { background: #2a2a2e; border-radius: 4px } ::-webkit-scrollbar-track { background: transparent }
+::-webkit-scrollbar { width: 8px; height: 8px } ::-webkit-scrollbar-thumb { background: var(--g-2a2a2e, #2a2a2e); border-radius: 4px } ::-webkit-scrollbar-track { background: transparent }
 textarea, input { font-family: inherit; user-select: text; }
 button { font-family: inherit; }
 button:disabled { cursor: default; }
-.prow:hover { background: #18181b !important; }
+.prow:hover { background: var(--g-18181b, #18181b) !important; }
 [data-ms] { font-family: 'Material Symbols Rounded'; font-weight: normal; font-style: normal; line-height: 1; letter-spacing: normal; text-transform: none; white-space: nowrap; word-wrap: normal; direction: ltr; -webkit-font-feature-settings: 'liga'; font-feature-settings: 'liga'; -webkit-font-smoothing: antialiased; }
 
 @keyframes spin { to { transform: rotate(360deg) } }

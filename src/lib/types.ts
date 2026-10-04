@@ -1,5 +1,8 @@
 export type ModelKey = "fast" | "accurate";
-export type Screen = "boot" | "welcome" | "why" | "check" | "download" | "ready" | "start" | "analysis" | "plan" | "result";
+export type Screen = "boot" | "welcome" | "why" | "check" | "download" | "ready" | "start" | "analysis" | "plan" | "result" | Page;
+export type Page = "history" | "rules" | "models" | "settings" | "watch";
+export const PAGES: Page[] = ["history", "rules", "models", "settings", "watch"];
+export const FLOW: Screen[] = ["start", "analysis", "plan", "result"];
 
 export const MODELS: Record<ModelKey, { name: string; acc: string; llm: string; embed: string; sizeGb: number; secPerFile: number }> = {
   fast: { name: "Быстрая", acc: "Быструю", llm: "gemma3:4b", embed: "bge-m3", sizeGb: 4.5, secPerFile: 8 },
@@ -20,6 +23,8 @@ export interface OllamaStatus { installed: boolean; running: boolean; models: st
 
 export interface HistoryItem { id: string; name: string; root: string; dest: string; date: string; until: string; files: number; undone: boolean }
 
+export interface HistoryEntry extends HistoryItem { time: string; status: "active" | "undone" | "expired"; folders: string[] }
+
 export interface BootState {
   onboarded: boolean;
   model: ModelKey | null;
@@ -28,6 +33,39 @@ export interface BootState {
   secPerFile: number | null;
   modelsDir: string;
   ollama: OllamaStatus;
+  settings?: Record<string, unknown>;
+}
+
+/* ── правила сортировки: решают раньше модели ── */
+export interface Project { id: string; name: string; keywords: string[] }
+export type RuleField = "name" | "text" | "from" | "type";
+export type RuleRename = "auto" | "keep" | "date";
+export interface Rule { id: string; field: RuleField; value: string; folder: string; rename: RuleRename }
+
+export interface WatchFolder { path: string; name: string; on: boolean; since: number; count: number; examples: string[]; exists: boolean; notified: number }
+
+export interface Settings {
+  theme: { mode: "system" | "light" | "dark" | "custom"; base: "graphite" | "midnight" | "oled" | "light"; accent: "green" | "blue" | "purple" | "orange" | "cyan" | "red" };
+  defRename: boolean;
+  defDatePrefix: boolean;
+  defLang: "ru" | "en";
+  excludes: string[];
+  autoPauseGames: boolean;
+  notifyDone: boolean;
+  watch: WatchFolder[];
+  watchThreshold: number;
+  projects: Project[];
+  rules: Rule[];
+}
+
+export interface ModelsInfo {
+  installed: boolean;
+  running: boolean;
+  version: string | null;
+  models: { name: string; size: number; modified: string }[];
+  modelsDir: string;
+  diskFreeGb: number | null;
+  diskLabel: string | null;
 }
 
 export interface QuickFolder { name: string; icon: string; path: string; count: number }
@@ -73,6 +111,7 @@ export interface FileItem {
   cluster: string;
   size: number;
   rejected: boolean;
+  by?: "rule" | "project" | "learned" | null; // кто решил, куда класть: ваше правило, ваш проект, выученный пример
 }
 
 export interface LockedUnit { id: string; name: string; why: string; rel: string; abs: string; n: number; cur: string }
@@ -100,6 +139,9 @@ export interface AnalyzeOptions {
   wishes: string;
   model: ModelKey;
   naming: Naming;
+  exclude: string[];
+  rules: Rule[];
+  projects: Project[];
 }
 
 export interface FeedItem { id: number; icon: string; c: string; old: string; name: string }

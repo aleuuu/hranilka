@@ -18,6 +18,7 @@ use tauri_plugin_notification::NotificationExt;
 pub struct AppState {
     data: PathBuf,
     busy: AtomicBool,
+    keep_tray: AtomicBool, // следим за папками — закрытие окна прячет его в трей, а не выходит
     engine: engine::EngineHost,
     pull: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     gpu: tokio::sync::Mutex<Option<JoinHandle<()>>>,
@@ -58,7 +59,58 @@ async fn boot_state(state: State<'_, AppState>) -> Result<Value, String> {
         "history": fsops::history(&state.data),
         "modelsDir": settings::models_dir(&state.data),
         "ollama": { "installed": installed, "running": running, "models": models },
+        "settings": Value::Object(s),
     }))
+}
+
+/* ───────────── история, модели, слежение ───────────── */
+
+#[tauri::command]
+fn history_all(state: State<'_, AppState>) -> Vec<Value> {
+    fsops::history_all(&state.data)
+}
+
+#[tauri::command]
+async fn ollama_models(state: State<'_, AppState>) -> Result<Value, String> {
+    let base = state.base();
+    let running = ollama::running(base).await;
+    let dir = settings::models_dir(&state.data);
+    let sys = tauri::async_runtime::spawn_blocking({
+        let d = dir.clone();
+        move || sys::system_check(&d).ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    Ok(json!({
+        "installed": ollama::exe_path().is_some(),
+        "running": running,
+        "version": if running { ollama::version(base).await } else { None },
+        "models": if running { ollama::models_detail(base).await } else { vec![] },
+        "modelsDir": dir,
+        "diskFreeGb": sys.as_ref().map(|s| s.disk_free_gb),
+        "diskLabel": sys.as_ref().map(|s| s.disk_label.clone()),
+    }))
+}
+
+#[tauri::command]
+async fn ollama_delete(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    ollama::delete(state.base(), &name).await
+}
+
+#[tauri::command]
+async fn ollama_start(state: State<'_, AppState>) -> Result<(), String> {
+    ollama::ensure_running(state.base(), settings::custom_models_dir(&state.data), 40).await
+}
+
+#[tauri::command]
+async fn count_new_files(path: String, since: u64) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || fsops::count_new_files(std::path::Path::new(&path), since)).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn app_paths(state: State<'_, AppState>) -> Value {
+    json!({ "data": state.data, "log": state.data.join("engine.log") })
 }
 
 #[tauri::command]
@@ -112,7 +164,7 @@ async fn engine_call(app: AppHandle, state: State<'_, AppState>, req: Value) -> 
         _ => 60,
     };
     let base = state.base().to_string();
-    if matches!(cmd.as_str(), "analyze" | "tune" | "describe_image") {
+    if matches!(cmd.as_str(), "analyze" | "tune" | "describe_image" | "learn") {
         ollama::ensure_running(&base, settings::custom_models_dir(&state.data), 30).await?;
     }
     state.engine.call(&app, &state.data, &base, req, Duration::from_secs(timeout)).await
@@ -192,9 +244,27 @@ fn hide_to_tray(app: AppHandle) {
 fn window_close(app: AppHandle, state: State<'_, AppState>) {
     if state.busy.load(Ordering::SeqCst) {
         hide_to_tray(app);
+    } else if state.keep_tray.load(Ordering::SeqCst) {
+        hide_watching(&app);
     } else {
         app.exit(0);
     }
+}
+
+/// Окно закрыли, а мы следим за папками: прячемся в трей. Подсказку показываем один раз за запуск.
+fn hide_watching(app: &AppHandle) {
+    static TOLD: AtomicBool = AtomicBool::new(false);
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+    if !TOLD.swap(true, Ordering::SeqCst) {
+        let _ = app.notification().builder().title("Хранилка следит за папками").body("Окно скрыто в трей. Напишу, когда накопятся новые файлы.").show();
+    }
+}
+
+#[tauri::command]
+fn set_keep_tray(state: State<'_, AppState>, on: bool) {
+    state.keep_tray.store(on, Ordering::SeqCst);
 }
 
 #[tauri::command]
@@ -236,12 +306,21 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--minimized"])))
         .setup(|app| {
+            // при автозапуске вместе с Windows стартуем свёрнутыми в трей, иначе — показываем окно
+            if !std::env::args().any(|a| a == "--minimized") {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
             let data = app.path().app_data_dir().unwrap_or_else(|_| settings::home().join(".hranilka"));
             std::fs::create_dir_all(&data).ok();
             app.manage(AppState {
                 data,
                 busy: AtomicBool::new(false),
+                keep_tray: AtomicBool::new(false),
                 engine: engine::EngineHost::default(),
                 pull: tokio::sync::Mutex::new(None),
                 gpu: tokio::sync::Mutex::new(None),
@@ -270,16 +349,20 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle();
-                let busy = app.state::<AppState>().busy.load(Ordering::SeqCst);
-                if busy {
+                let st = app.state::<AppState>();
+                if st.busy.load(Ordering::SeqCst) {
                     api.prevent_close();
                     hide_to_tray(app.clone());
+                } else if st.keep_tray.load(Ordering::SeqCst) {
+                    api.prevent_close();
+                    hide_watching(app);
                 }
             }
         })
         .invoke_handler(tauri::generate_handler![
             boot_state, save_settings, system_check, ollama_status, pull_start, pull_pause, engine_call, quick_folders,
-            apply_start, apply_stop, undo_start, open_path, set_busy, hide_to_tray, window_close, gpu_watch, gpu_wait_exit
+            apply_start, apply_stop, undo_start, open_path, set_busy, hide_to_tray, window_close, gpu_watch, gpu_wait_exit,
+            history_all, ollama_models, ollama_delete, ollama_start, count_new_files, app_paths, set_keep_tray
         ])
         .build(tauri::generate_context!())
         .expect("не удалось запустить Хранилку")

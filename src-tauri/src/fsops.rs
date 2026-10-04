@@ -377,6 +377,11 @@ pub fn undo(app: &AppHandle, data: &Path, session_id: &str) -> Result<UndoResult
 
 /// Список сортировок для боковой панели (новые сверху, без отменённых и просроченных).
 pub fn history(data: &Path) -> Vec<Value> {
+    history_all(data).into_iter().filter(|h| h["status"] == "active").collect()
+}
+
+/// Все сортировки для страницы «История»: активные, отменённые и с истёкшим сроком отмены.
+pub fn history_all(data: &Path) -> Vec<Value> {
     let today = Local::now().format("%Y-%m-%d").to_string();
     let mut out = vec![];
     let Ok(rd) = fs::read_dir(journal_dir(data)) else { return out };
@@ -385,21 +390,68 @@ pub fn history(data: &Path) -> Vec<Value> {
         if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
             continue;
         }
-        let (head, entries, _, undone) = read_journal(&p);
-        if head.is_null() || undone || entries.is_empty() {
+        let (head, entries, dirs, undone) = read_journal(&p);
+        if head.is_null() || entries.is_empty() {
             continue;
         }
         let until = head["until"].as_str().unwrap_or("").to_string();
-        if until.as_str() < today.as_str() {
-            continue;
+        let status = if undone { "undone" } else if until.as_str() < today.as_str() { "expired" } else { "active" };
+        // верхние папки, которые создала эта сортировка
+        let dest = PathBuf::from(head["dest"].as_str().unwrap_or(""));
+        let mut folders: Vec<String> = vec![];
+        for d in dirs.iter().chain(entries.iter().filter_map(|x| x.dst.parent().map(|q| q.to_path_buf())).collect::<Vec<_>>().iter()) {
+            if let Ok(rel) = d.strip_prefix(&dest) {
+                if let Some(first) = rel.components().next() {
+                    let s = first.as_os_str().to_string_lossy().to_string();
+                    if !folders.contains(&s) {
+                        folders.push(s);
+                    }
+                }
+            }
         }
+        let id = head["id"].as_str().unwrap_or("").to_string();
+        // время из id сессии: s20261005-001126-416 → 00:11
+        let time = id.get(10..14).map(|t| format!("{}:{}", &t[..2], &t[2..])).unwrap_or_default();
         out.push(json!({
-            "id": head["id"], "name": head["name"], "root": head["root"], "dest": head["dest"], "date": head["date"],
-            "until": until, "files": entries.len(), "undone": false
+            "id": id, "name": head["name"], "root": head["root"], "dest": head["dest"], "date": head["date"], "time": time,
+            "until": until, "files": entries.len(), "undone": undone, "status": status, "folders": folders
         }));
     }
     out.sort_by(|a, b| b["id"].as_str().cmp(&a["id"].as_str()));
     out
+}
+
+const PERSONAL_EXT: &[&str] = &[
+    "jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "bmp", "tif", "tiff", "pdf", "docx", "xlsx", "txt", "md", "rtf", "html", "htm",
+    "csv", "pptx", "odt", "mp4", "mov", "webm", "mkv", "avi", "m4v", "mp3", "wav", "m4a", "ogg", "flac", "aac",
+];
+
+/// Сколько личных файлов появилось в корне папки после момента since (мс с 1970). Для «Следить за папкой».
+pub fn count_new_files(path: &Path, since_ms: u64) -> Value {
+    let mut n = 0u64;
+    let mut examples = vec![];
+    if let Ok(rd) = fs::read_dir(path) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_file() {
+                continue;
+            }
+            let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("").to_lowercase();
+            if !PERSONAL_EXT.contains(&ext.as_str()) {
+                continue;
+            }
+            // скопированный файл сохраняет старую дату изменения, зато получает новую дату создания — берём позднюю
+            let ms = |t: std::io::Result<std::time::SystemTime>| t.ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64).unwrap_or(0);
+            let t = fs::metadata(&p).map(|m| ms(m.modified()).max(ms(m.created()))).unwrap_or(0);
+            if t > since_ms {
+                n += 1;
+                if examples.len() < 3 {
+                    examples.push(p.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default());
+                }
+            }
+        }
+    }
+    json!({ "count": n, "examples": examples, "exists": path.is_dir() })
 }
 
 /// Сколько файлов в папке (с ограничением по времени и количеству).

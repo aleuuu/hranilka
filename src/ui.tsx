@@ -1,13 +1,30 @@
 import React, { CSSProperties, useEffect, useRef, useState } from "react";
+import { GRAY_SET } from "./theme";
 
 /** Строку стилей из макета ("height:44px;padding:0 26px") превращает в объект React-стилей.
  *  Так разметку можно переносить из макета дословно, без ручной конвертации. */
 const cache = new Map<string, CSSProperties>();
 const camel = (p: string) => p.replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
 
+/** Цвета макета → переменные темы: серые → --g-xxxxxx, зелёный акцент (оттенок 155) → --acc-h,
+ *  яркость цветных оттенков сдвигается на --dl (в светлой теме цвета темнеют, чтобы читаться на белом). */
+export function themed(s: string): string {
+  return s
+    .replace(/#([0-9a-fA-F]{6})([0-9a-fA-F]{2})?\b|#fff\b/g, (m, h: string | undefined, a: string | undefined) => {
+      const hex = (h || "ffffff").toLowerCase();
+      if (!GRAY_SET.has(hex)) return m;
+      // #0e0e0fcc — серый с прозрачностью
+      return a ? `color-mix(in srgb, var(--g-${hex}, #${hex}) ${Math.round(parseInt(a, 16) / 2.55)}%, transparent)` : `var(--g-${hex}, #${hex})`;
+    })
+    .replace(/oklch\(([\d.]+) ([\d.]+) ([\d.]+)( \/ [\d.]+)?\)/g, (_m, l: string, c: string, h: string, a?: string) =>
+      `oklch(calc(${l} + var(--dl, 0)) ${c} ${h === "155" ? "var(--acc-h, 155)" : h}${a || ""})`);
+}
+
 export function css(s: string): CSSProperties {
   const hit = cache.get(s);
   if (hit) return hit;
+  const src = s;
+  s = themed(s);
   const out: Record<string, string> = {};
   let depth = 0, quote: string | null = null, cur = "";
   const push = (decl: string) => {
@@ -26,7 +43,7 @@ export function css(s: string): CSSProperties {
   }
   push(cur);
   if (cache.size > 4000) cache.clear();
-  cache.set(s, out as CSSProperties);
+  cache.set(src, out as CSSProperties);
   return out as CSSProperties;
 }
 

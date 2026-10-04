@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { B, Ic, css, useRerenderUntil } from "../ui";
-import { clearFolder, estimateSec, loadQuick, rescan, selectFolder, set, startAnalysis, useApp } from "../store";
+import { clearFolder, estimateSec, go, loadQuick, rescan, selectFolder, set, startAnalysis, useApp } from "../store";
 import { api } from "../lib/api";
 import { fmtDur, fmtShort, nf, plural } from "../lib/format";
 
@@ -28,6 +28,8 @@ export function Start() {
     ? [locked ? `${locked} ${plural(locked, ["папку-проект", "папки-проекта", "папок-проектов"])} не тронем` : "", skippedFiles ? `${nf(skippedFiles)} ${plural(skippedFiles, ["программный файл", "программных файла", "программных файлов"])} пропустим` : ""].filter(Boolean).join(" · ")
     : "Пропускать нечего — все файлы личные";
   const recent = (s.boot?.recentWishes || []).slice(0, 2);
+  const np = s.settings.projects.length, nr = s.settings.rules.length;
+  const mine = [np ? `${np} ${plural(np, ["проект", "проекта", "проектов"])}` : "", nr ? `${nr} ${plural(nr, ["правило", "правила", "правил"])}` : ""].filter(Boolean).join(" и ");
   const pickDest = async () => {
     const dir = await api.pickFolder();
     if (dir) set({ dest: "other", destPath: dir });
@@ -154,7 +156,7 @@ export function Start() {
             {([["Переименовывать файлы", "rename"], ["Дата в начале имени для фото", "datePrefix"]] as const).map(([l, key]) => (
               <button key={key} onClick={() => set({ [key]: !s[key] } as any)} style={css("height:42px;display:flex;align-items:center;gap:10px;padding:0 14px;border:none;border-bottom:1px solid #1a1a1d;background:transparent;color:#d6d6d9;font:400 13px 'Onest';cursor:pointer;text-align:left")}>
                 <span style={css("flex:1")}>{l}</span>
-                <span style={css(`width:34px;height:20px;border-radius:10px;background:${s[key] ? "oklch(0.72 0.15 155)" : "#2a2a2e"};position:relative;transition:background .2s`)}><span style={css(`position:absolute;top:2px;left:${s[key] ? 16 : 2}px;width:16px;height:16px;border-radius:8px;background:#fff;transition:left .2s cubic-bezier(.2,.8,.2,1)`)} /></span>
+                <span style={css(`width:34px;height:20px;border-radius:10px;background:${s[key] ? "oklch(0.72 0.15 155)" : "#2a2a2e"};position:relative;transition:background .2s`)}><span style={css(`position:absolute;top:2px;left:${s[key] ? 16 : 2}px;width:16px;height:16px;border-radius:8px;background:#fefefe;transition:left .2s cubic-bezier(.2,.8,.2,1)`)} /></span>
               </button>
             ))}
             <div style={css("height:46px;display:flex;align-items:center;gap:10px;padding:0 14px;border-bottom:1px solid #1a1a1d")}>
@@ -173,6 +175,13 @@ export function Start() {
               </div>
             </div>
           </div>
+          <B as="button" onClick={() => go("rules")} title="Проекты и правила срабатывают раньше модели"
+            s="display:flex;align-items:center;gap:8px;height:34px;padding:0 8px;margin-top:-4px;border:none;border-radius:8px;background:transparent;color:#8b8b90;font:400 13px 'Onest';cursor:pointer;text-align:left"
+            h="background:#141416;color:#ededee">
+            <Ic n="rule_folder" s="font-size:17px" />
+            <span style={css("flex:1")}>{mine ? `Учтём ваши ${mine}` : "Свои проекты и правила — разложу точнее"}</span>
+            <span style={css("font:500 12px 'Onest';color:#6d6d73")}>{mine ? "Изменить" : "Настроить"}</span>
+          </B>
         </div>
       </div>
       <div style={css("height:66px;flex:none;border-top:1px solid #1c1c1f;display:flex;align-items:center;gap:12px;padding:0 22px")}>

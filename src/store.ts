@@ -2,10 +2,16 @@ import { useSyncExternalStore } from "react";
 import { api } from "./lib/api";
 import type {
   ApplyOp, ApplyResult, BootState, CurrentFile, FeedItem, FileItem, GpuState, LockedUnit, ModelKey, Naming,
-  PlanData, PullProgress, QuickFolder, ScanSummary, Screen, SysInfo, Theme, TuneMsg, UndoResult,
+  PlanData, PullProgress, QuickFolder, ScanSummary, Screen, Settings, SysInfo, Theme, TuneMsg, UndoResult, WatchFolder,
 } from "./lib/types";
-import { MODELS } from "./lib/types";
+import { FLOW, MODELS } from "./lib/types";
 import { localIso, plural } from "./lib/format";
+import { DEFAULT_THEME, applyTheme, watchSystem } from "./theme";
+
+export const DEFAULT_SETTINGS: Settings = {
+  theme: DEFAULT_THEME, defRename: true, defDatePrefix: true, defLang: "ru", excludes: [], autoPauseGames: false, notifyDone: true,
+  watch: [], watchThreshold: 20, projects: [], rules: [],
+};
 
 export const LOCKED_DIR = "Программы и проекты";
 
@@ -74,7 +80,7 @@ export interface AppState {
   view: "tree" | "grid";
   projBanner: boolean;
   privShown: Record<number, boolean>;
-  toast: { text: string; at: number } | null;
+  toast: { text: string; at: number; learn?: number; busy?: boolean } | null;
   dragOver: string | null;
   tuneOpen: boolean;
   msgs: TuneMsg[];
@@ -89,6 +95,12 @@ export interface AppState {
   undoRes: UndoResult | null;
   undone: boolean;
   lockedDone: Record<string, string>;
+  // настройки и страницы
+  settings: Settings;
+  flow: Screen;            // где пользователь был в сценарии сортировки — туда ведёт «Разобрать»
+  planBadge: boolean;      // план готов, пока пользователь смотрел другую страницу
+  rulesDirty: boolean;     // правила или проекты поменялись — при возврате к плану пересоберём его
+  pullKey: ModelKey | null; // скачивание со страницы «Модели»
 }
 
 const emptyAn = (): AnState => ({
@@ -109,6 +121,7 @@ let state: AppState = {
   tuneInput: "", tuneBusy: false,
   modal: null, prog: { n: 0, total: 0, lines: [] }, sessions: [], applyRes: null, stopN: 0, undoRes: null, undone: false,
   lockedDone: {},
+  settings: DEFAULT_SETTINGS, flow: "start", planBadge: false, rulesDirty: false, pullKey: null,
 };
 
 const subs = new Set<() => void>();
@@ -123,7 +136,40 @@ export function useApp(): AppState {
   return useSyncExternalStore((l) => { subs.add(l); return () => subs.delete(l); }, () => state);
 }
 
-export const go = (screen: Screen, extra?: Partial<AppState>) => set({ screen, modal: null, tuneOpen: false, ...(extra || {}) });
+export const go = (screen: Screen, extra?: Partial<AppState>) =>
+  set({ screen, modal: null, tuneOpen: false, ...(FLOW.includes(screen) ? { flow: screen, planBadge: false } : null), ...(extra || {}) });
+
+/** «Разобрать» в боковой панели: туда, где пользователь остановился в сортировке. */
+export function goFlow() {
+  go(state.flow);
+  if (state.flow === "plan" && state.rulesDirty) applyRulesToPlan();
+}
+
+/* ───────────────────────── настройки ───────────────────────── */
+
+function parseSettings(raw: Record<string, unknown> | undefined): Settings {
+  const r = (raw || {}) as Partial<Settings>;
+  const out = { ...DEFAULT_SETTINGS };
+  for (const k of Object.keys(DEFAULT_SETTINGS) as (keyof Settings)[]) {
+    if (r[k] !== undefined && r[k] !== null && typeof r[k] === typeof DEFAULT_SETTINGS[k]) (out as any)[k] = r[k];
+  }
+  out.theme = { ...DEFAULT_THEME, ...(out.theme || {}) };
+  return out;
+}
+
+export function saveSet(patch: Partial<Settings>) {
+  const settings = { ...state.settings, ...patch };
+  set({ settings, ...((patch.rules || patch.projects) && state.plan ? { rulesDirty: true } : null) });
+  api.saveSettings(patch as Record<string, unknown>).catch(() => {});
+  if (patch.theme) applyTheme(settings.theme);
+  if (patch.watch) api.setKeepTray(settings.watch.some((w) => w.on)).catch(() => {});
+}
+
+const notifyDone = (title: string, body: string) => {
+  if (state.settings.notifyDone && document.hidden) api.notify(title, body);
+};
+
+export const uid = () => Math.random().toString(36).slice(2, 10);
 
 /* ───────────────────────── запуск ───────────────────────── */
 
@@ -146,7 +192,12 @@ export async function bootApp() {
   catch (e) { boot = { onboarded: false, model: null, recentWishes: [], history: [], secPerFile: null, modelsDir: "", ollama: { installed: false, running: false, models: [] } }; console.error(e); }
   const installed = boot.ollama.models || [];
   const model = boot.model;
-  set({ boot, model, installed, secPerFile: boot.secPerFile });
+  const settings = parseSettings(boot.settings);
+  applyTheme(settings.theme);
+  watchSystem(() => state.settings.theme);
+  set({ boot, model, installed, secPerFile: boot.secPerFile, settings, rename: settings.defRename, datePrefix: settings.defDatePrefix, nameLang: settings.defLang });
+  api.setKeepTray(settings.watch.some((w) => w.on)).catch(() => {});
+  startWatcher();
   if (boot.onboarded && model && modelInstalled(model, installed)) {
     go("start");
     loadQuick();
@@ -191,9 +242,23 @@ export function onPull(p: PullProgress) {
   set({ pull: p });
   if (p.done) {
     api.ollamaStatus().then((st) => set({ installed: st.models || [] })).catch(() => {});
-    api.saveSettings({ model: currentModel() });
-    if (document.hidden) api.notify("Хранилка", "Модель скачана — можно наводить порядок");
+    if (state.pullKey) set({ pullKey: null }); // докачали со страницы «Модели» — текущую модель не меняем
+    else api.saveSettings({ model: currentModel() });
+    notifyDone("Хранилка", "Модель скачана — можно наводить порядок");
   }
+}
+
+/** Скачать модель со страницы «Модели». */
+export async function pullModel(key: ModelKey) {
+  set({ pullKey: key, pullStarted: true, pullPaused: false, pull: { phase: "model", completed: 0, total: MODELS[key].sizeGb * 1024 ** 3, speed: 0, done: false, slow: false, error: null } });
+  try { await api.pullStart(key); } catch (e: any) {
+    set({ pull: { phase: "model", completed: 0, total: 1, speed: 0, done: false, slow: false, error: { kind: "other", message: String(e?.message || e) } } });
+  }
+}
+
+export async function chooseModel(key: ModelKey) {
+  set({ model: key });
+  await api.saveSettings({ model: key });
 }
 
 /* ───────────────────────── готово: проверка на картинке ───────────────────────── */
@@ -235,7 +300,7 @@ export async function rescan() {
   set({ scanning: true, scanErr: null });
   try {
     const unskip = Object.keys(state.unskip).filter((k) => state.unskip[k]);
-    const scan = await api.scan(root, unskip);
+    const scan = await api.scan(root, unskip, state.settings.excludes);
     if (state.folder !== root) return;
     set({ scan, scanning: false, scanDoneAt: performance.now(), folderName: scan.rootDisplay || state.folderName });
   } catch (e: any) {
@@ -263,12 +328,15 @@ export async function startAnalysis() {
     set({ boot: s.boot ? { ...s.boot, recentWishes: rw } : s.boot });
     api.saveSettings({ recentWishes: rw });
   }
-  set({ an: { ...emptyAn(), stage: 1, total: s.scan.total }, gpu: null, gpuChoice: null, plan: null });
+  set({ an: { ...emptyAn(), stage: 1, total: s.scan.total }, gpu: null, gpuChoice: null, plan: null, rulesDirty: false });
   go("analysis");
   api.setBusy(true);
   api.gpuWatch(true);
   try {
-    await api.analyze({ root: s.folder, dest, unskip: Object.keys(s.unskip).filter((k) => s.unskip[k]), wishes: wish, model: currentModel(), naming });
+    await api.analyze({
+      root: s.folder, dest, unskip: Object.keys(s.unskip).filter((k) => s.unskip[k]), wishes: wish, model: currentModel(), naming,
+      exclude: s.settings.excludes, rules: s.settings.rules, projects: s.settings.projects,
+    });
   } catch (e: any) {
     set({ an: { ...state.an, error: String(e?.message || e) } });
   }
@@ -300,7 +368,18 @@ export function onEngine(ev: any) {
   }
 }
 
-export function onGpu(g: GpuState) { set({ gpu: g }); }
+export function onGpu(g: GpuState) {
+  set({ gpu: g });
+  // «Пауза, когда запущена игра» в настройках: не спрашиваем, а сразу ждём выхода из игры
+  const s = state;
+  if (g.busy && s.settings.autoPauseGames && !s.gpuChoice && !s.an.paused && s.an.stage >= 1 && s.an.stage < 2) gpuWait();
+}
+
+/** Продолжить анализ, не дожидаясь выхода из игры. */
+export async function gpuResume() {
+  set({ gpuChoice: "slow", an: { ...state.an, paused: false } });
+  await api.analysisPause(false);
+}
 
 export async function toggleAnalysisPause() {
   const on = !state.an.paused;
@@ -329,6 +408,7 @@ export async function showPlanNow() {
 /* ───────────────────────── план ───────────────────────── */
 
 function onPlan(plan: PlanData) {
+  const away = !FLOW.includes(state.screen); // пользователь ушёл на другую страницу — не выдёргиваем его оттуда
   const files = plan.files.map((f) => ({ ...f, cur: f.cur || f.abs, engineTo: f.to, orig: f.name, rejected: false }));
   set({
     plan, files, hist: [], versions: [{ files, mapping: plan.mapping, naming: plan.naming }], verSel: 1,
@@ -339,8 +419,9 @@ function onPlan(plan: PlanData) {
   });
   api.setBusy(false);
   api.gpuWatch(false);
-  go("plan");
-  if (document.hidden) api.notify("Хранилка", `План готов: ${plan.files.length} ${plural(plan.files.length, ["файл", "файла", "файлов"])}`);
+  if (away) set({ flow: "plan", planBadge: true });
+  else go("plan");
+  notifyDone("Хранилка", `План готов: ${plan.files.length} ${plural(plan.files.length, ["файл", "файла", "файлов"])}`);
 }
 
 function commit(files: FileItem[], extra?: Partial<AppState>) {
@@ -366,8 +447,69 @@ export function moveFile(id: number, to: string) {
   const f = state.files.find((x) => x.id === id);
   if (!f || f.to === to) { set({ dragOver: null }); return; }
   commit(state.files.map((x) => (x.id === id ? { ...x, to, manualTo: to } : x)), {
-    dragOver: null, hist: pushHist(), toast: { text: "«" + f.name + "» → " + to.split("/").pop(), at: performance.now() }, sel: "f:" + id,
+    dragOver: null, hist: pushHist(), toast: { text: "«" + f.name + "» → " + to.split("/").pop(), at: performance.now(), learn: id }, sel: "f:" + id,
   });
+}
+
+/** Новый план от движка поверх текущего: ручные переносы, имена и отклонения пользователя сохраняются. */
+function mergeFiles(fresh: FileItem[]): FileItem[] {
+  const cur = new Map(state.files.map((f) => [f.id, f]));
+  return fresh.map((nf) => {
+    const o = cur.get(nf.id);
+    const base = { ...nf, cur: o?.cur || nf.abs, engineTo: nf.to, orig: nf.name, rejected: o?.rejected || false } as FileItem;
+    if (o?.manualTo) { base.to = o.manualTo; base.manualTo = o.manualTo; }
+    if (o?.manualName) { base.name = o.manualName; base.manualName = o.manualName; }
+    return base;
+  });
+}
+
+/** «Запомнить» после перетаскивания: движок запоминает файл и его папку, похожие файлы плана переезжают туда же. */
+export async function rememberMove(id: number) {
+  const f = state.files.find((x) => x.id === id);
+  const v = state.versions[state.verSel - 1];
+  if (!f || !v) return;
+  const folder = f.to;
+  set({ toast: { text: "Запоминаю…", at: performance.now(), busy: true } });
+  try {
+    await api.learn([id], folder);
+    const r = await api.replan({ rules: state.settings.rules, projects: state.settings.projects, mapping: v.mapping, naming: v.naming });
+    const before = new Map(state.files.map((x) => [x.id, x.to]));
+    const files = mergeFiles(r.files);
+    const moved = files.filter((x) => x.id !== id && before.get(x.id) !== x.to && x.to === folder).length;
+    commit(files, {
+      hist: moved ? pushHist() : state.hist,
+      toast: { text: moved ? `Запомнил. Ещё ${moved} ${plural(moved, ["похожий файл", "похожих файла", "похожих файлов"])} — туда же` : `Запомнил: похожие файлы буду класть в «${folder.split("/").pop()}»`, at: performance.now() },
+    });
+  } catch (e: any) {
+    set({ toast: { text: "Не получилось запомнить: " + String(e?.message || e), at: performance.now() } });
+  }
+}
+
+/** «Запомнить проекты» в баннере плана: найденные проекты попадут в «Правила» и будут узнаваться по названию. */
+export function rememberProjects() {
+  const plan = state.plan;
+  if (!plan) return;
+  const have = new Set(state.settings.projects.map((p) => p.name.toLowerCase()));
+  const add = plan.projects.filter((n) => !have.has(n.toLowerCase())).map((name) => ({ id: uid(), name, keywords: [] }));
+  if (add.length) {
+    saveSet({ projects: [...state.settings.projects, ...add] });
+    set({ rulesDirty: false });
+  }
+  set({ projBanner: false, toast: { text: add.length ? `Запомнил ${add.length === 1 ? "проект" : "проекты"}: ${add.map((p) => p.name).join(", ")}. Ключевые слова — в «Правилах»` : "Эти проекты уже запомнены", at: performance.now() } });
+}
+
+/** Правила поменялись, пока был открыт план: пересобираем его без модели. */
+export async function applyRulesToPlan() {
+  const v = state.versions[state.verSel - 1];
+  if (!state.plan || !v) return;
+  set({ rulesDirty: false });
+  try {
+    const r = await api.replan({ rules: state.settings.rules, projects: state.settings.projects, mapping: v.mapping, naming: v.naming });
+    const before = new Map(state.files.map((x) => [x.id, x.to]));
+    const files = mergeFiles(r.files);
+    const moved = files.filter((x) => before.get(x.id) !== x.to).length;
+    if (moved) commit(files, { hist: pushHist(), plan: { ...state.plan!, projects: r.projects }, toast: { text: `Учёл новые правила: ${moved} ${plural(moved, ["файл переехал", "файла переехали", "файлов переехали"])}`, at: performance.now() } });
+  } catch { /* план устарел (движок перезапускался) — правила учтутся в следующем анализе */ }
 }
 
 export function renameFile(id: number, name: string, record = false) {
@@ -411,20 +553,13 @@ export async function sendTune(text: string) {
   set({ msgs, tuneInput: "", tuneBusy: true });
   const v = s.versions[s.verSel - 1];
   try {
-    const r = await api.tune({ text, history: msgs, mapping: v.mapping, naming: v.naming, wishes: s.wishes, model: currentModel() });
+    const r = await api.tune({ text, history: msgs, mapping: v.mapping, naming: v.naming, wishes: s.wishes, model: currentModel(), rules: s.settings.rules, projects: s.settings.projects });
     if (r.question) {
       set({ tuneBusy: false, msgs: [...state.msgs, { ai: true, text: r.question, opts: r.options }] });
       return;
     }
     if (r.files) {
-      const cur = new Map(state.files.map((f) => [f.id, f]));
-      const files = r.files.map((nf) => {
-        const o = cur.get(nf.id);
-        const base = { ...nf, cur: o?.cur || nf.abs, engineTo: nf.to, orig: nf.name, rejected: o?.rejected || false } as FileItem;
-        if (o?.manualTo) { base.to = o.manualTo; base.manualTo = o.manualTo; }
-        if (o?.manualName) { base.name = o.manualName; base.manualName = o.manualName; }
-        return base;
-      });
+      const files = mergeFiles(r.files);
       const diff = diffText(state.files, files);
       if (diff === "Без изменений") {
         // ничего не поменялось — не плодим пустую версию и честно говорим об этом
@@ -509,6 +644,11 @@ export async function startApply(onlyIds?: string[]) {
       const h = { id: res.sessionId, name: s.plan.rootDisplay, root: s.plan.root, dest: s.plan.dest, date: localIso(), until: res.until, files: merged.moved, undone: false };
       set({ boot: { ...boot, history: [h, ...boot.history.filter((x) => x.id !== h.id)].slice(0, 8) } });
     }
+    // разобрали папку, за которой следим, — новые файлы считаем с этого момента
+    const root = norm(s.plan.root);
+    if (state.settings.watch.some((w) => norm(w.path) === root)) {
+      saveSet({ watch: state.settings.watch.map((w) => (norm(w.path) === root ? { ...w, since: Date.now(), count: 0, examples: [], notified: 0 } : w)) });
+    }
     if (state.modal === "stop" || res.stopped) { set({ modal: "stop" }); return; }
     go("result", { undone: false, undoRes: null });
   } catch (e: any) {
@@ -549,6 +689,40 @@ export async function startUndo(toScreen: Screen = "result") {
 export function newSort() {
   set({ plan: null, files: [], versions: [], hist: [], sessions: [], applyRes: null, undoRes: null, undone: false, sel: null, lockedDone: {} });
   go("start", { folder: null, folderName: null, scan: null });
+}
+
+/* ───────────────────────── слежение за папками ───────────────────────── */
+
+const WATCH_EVERY = 10 * 60 * 1000;
+let watchTimer: ReturnType<typeof setInterval> | null = null;
+
+function startWatcher() {
+  if (watchTimer) return;
+  watchTimer = setInterval(() => { checkWatch(); }, WATCH_EVERY);
+  setTimeout(() => { checkWatch(); }, 20000);
+}
+
+/** Считает новые файлы в папках, за которыми следим, и напоминает, когда их накопилось достаточно. */
+export async function checkWatch() {
+  const list = state.settings.watch;
+  if (!list.length) return;
+  const next: WatchFolder[] = [];
+  for (const w of list) {
+    if (!w.on) { next.push(w); continue; }
+    try {
+      const r = await api.countNewFiles(w.path, w.since);
+      let notified = w.notified;
+      const th = Math.max(1, state.settings.watchThreshold);
+      if (r.count >= th && r.count >= notified + th) {
+        notified = r.count;
+        api.notify("Хранилка", `В «${w.name}» ${r.count} ${plural(r.count, ["новый файл", "новых файла", "новых файлов"])} — откройте Хранилку, чтобы разобрать`);
+      }
+      next.push({ ...w, count: r.count, examples: r.examples, exists: r.exists, notified });
+    } catch { next.push(w); }
+  }
+  // за время проверки список могли поменять — обновляем только то, что ещё есть
+  const fresh = new Map(next.map((w) => [w.path, w]));
+  saveSet({ watch: state.settings.watch.map((w) => { const f = fresh.get(w.path); return f && f.on === w.on ? { ...w, count: f.count, examples: f.examples, exists: f.exists, notified: f.notified } : w; }) });
 }
 
 export type { LockedUnit, QuickFolder };

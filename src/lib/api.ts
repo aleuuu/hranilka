@@ -1,6 +1,6 @@
 import type {
-  AnalyzeOptions, ApplyOp, ApplyResult, BootState, FileItem, ModelKey, Naming, OllamaStatus,
-  QuickFolder, ScanSummary, SysInfo, TuneMsg, TuneReply, UndoResult,
+  AnalyzeOptions, ApplyOp, ApplyResult, BootState, FileItem, HistoryEntry, ModelKey, ModelsInfo, Naming, OllamaStatus,
+  Project, QuickFolder, Rule, ScanSummary, SysInfo, TuneMsg, TuneReply, UndoResult,
 } from "./types";
 import { mockApi } from "./mock";
 
@@ -17,11 +17,25 @@ export interface Api {
   pickFolder(): Promise<string | null>;
   pickImage(): Promise<{ path: string; name: string; dataUrl: string } | null>;
   quickFolders(): Promise<QuickFolder[]>;
-  scan(root: string, unskip: string[]): Promise<ScanSummary>;
+  scan(root: string, unskip: string[], exclude: string[]): Promise<ScanSummary>;
   analyze(opts: AnalyzeOptions): Promise<void>;
   analysisPause(on: boolean): Promise<void>;
   analysisStop(): Promise<void>;
-  tune(req: { text: string; history: TuneMsg[]; mapping: Record<string, string>; naming: Naming; wishes: string; model: ModelKey }): Promise<TuneReply>;
+  tune(req: { text: string; history: TuneMsg[]; mapping: Record<string, string>; naming: Naming; wishes: string; model: ModelKey; rules: Rule[]; projects: Project[] }): Promise<TuneReply>;
+  learn(ids: number[], folder: string): Promise<{ count: number }>;
+  replan(req: { rules: Rule[]; projects: Project[]; mapping: Record<string, string>; naming: Naming }): Promise<{ files: FileItem[]; projects: string[] }>;
+  learnedInfo(): Promise<{ count: number; folders: { folder: string; n: number }[] }>;
+  learnedReset(): Promise<{ count: number }>;
+  historyAll(): Promise<HistoryEntry[]>;
+  ollamaModels(): Promise<ModelsInfo>;
+  ollamaDelete(name: string): Promise<void>;
+  ollamaStart(): Promise<void>;
+  countNewFiles(path: string, since: number): Promise<{ count: number; examples: string[]; exists: boolean }>;
+  appPaths(): Promise<{ data: string; log: string }>;
+  appVersion(): Promise<string>;
+  autostart(on?: boolean): Promise<boolean>;
+  setKeepTray(on: boolean): Promise<void>;
+  openUrl(url: string): Promise<void>;
   apply(req: { name: string; root: string; dest: string; ops: ApplyOp[]; sessionId?: string }): Promise<ApplyResult>;
   applyStop(): Promise<void>;
   undo(sessionId: string): Promise<UndoResult>;
@@ -64,15 +78,34 @@ function tauriApi(): Api {
       return { path: r, name: r.split(/[\\/]/).pop() || r, dataUrl: convertFileSrc(r) };
     },
     quickFolders: () => call("quick_folders"),
-    scan: (root, unskip) => engine({ cmd: "scan", root, unskip }),
+    scan: (root, unskip, exclude) => engine({ cmd: "scan", root, unskip, exclude }),
     analyze: (opts) => engine({ cmd: "analyze", ...opts }),
     analysisPause: (on) => engine({ cmd: "pause", on }),
     analysisStop: () => engine({ cmd: "stop_and_plan" }),
     tune: (req) => engine({ cmd: "tune", ...req }),
+    learn: (ids, folder) => engine({ cmd: "learn", ids, folder }),
+    replan: (req) => engine({ cmd: "replan", ...req }),
+    learnedInfo: () => engine({ cmd: "learned_info" }),
+    learnedReset: () => engine({ cmd: "learned_reset" }),
+    historyAll: () => call("history_all"),
+    ollamaModels: () => call("ollama_models"),
+    ollamaDelete: (name) => call("ollama_delete", { name }),
+    ollamaStart: () => call("ollama_start"),
+    countNewFiles: (path, since) => call("count_new_files", { path, since: Math.max(0, Math.floor(since)) }),
+    appPaths: () => call("app_paths"),
+    appVersion: async () => { const { getVersion } = await import("@tauri-apps/api/app"); return getVersion(); },
+    autostart: async (on) => {
+      const a = await import("@tauri-apps/plugin-autostart");
+      if (on === true) await a.enable();
+      else if (on === false) await a.disable();
+      return a.isEnabled();
+    },
+    setKeepTray: (on) => call("set_keep_tray", { on }),
+    openUrl: async (url) => { const { openUrl } = await import("@tauri-apps/plugin-opener"); await openUrl(url); },
     apply: (req) => call("apply_start", { req }),
     applyStop: () => call("apply_stop"),
     undo: (sessionId) => call("undo_start", { sessionId }),
-    openPath: async (path) => { const { openPath } = await import("@tauri-apps/plugin-opener"); await openPath(path); },
+    openPath: (path) => call("open_path", { path: path.replace(/\//g, "\\") }),
     setBusy: (busy) => call("set_busy", { busy }),
     hideToTray: () => call("hide_to_tray"),
     gpuWatch: (on) => call("gpu_watch", { on }),

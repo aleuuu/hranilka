@@ -126,6 +126,7 @@ class Item:
     thumb: str | None = None
     category: str = ""
     cluster: str = ""
+    vec: object = None       # смысловой отпечаток (для обучения на правках)
 
     @property
     def from_rel(self) -> str:
@@ -175,6 +176,7 @@ CATS = {
     "webpages": ("language", "Сохранённые веб-страницы"), "installers": ("install_desktop", "Установщики"),
     "archives": ("folder_zip", "Архивы"), "temp": ("hourglass_empty", "Временные файлы"),
     "service": ("settings", "Служебные файлы"), "other": ("help", "Другие типы файлов"),
+    "excluded": ("block", "Исключено в настройках"),
 }
 
 
@@ -217,12 +219,16 @@ def count_files(p: Path, limit=100000) -> int:
     return n
 
 
-def scan(root: Path, unskip: set[str]) -> Scan:
+def scan(root: Path, unskip: set[str], exclude: set[str] | None = None) -> Scan:
+    exclude = {e.lower().rstrip("\\/") for e in (exclude or set())}
     if not root.exists() or not root.is_dir():
         raise RuntimeError("Папка не найдена или недоступна")
     parts = [p.lower() for p in root.resolve().parts]
     if len(parts) >= 2 and parts[1] in {"windows", "program files", "program files (x86)", "programdata"}:
         raise RuntimeError("Это системная папка — её разбирать нельзя")
+    r = str(root).lower().rstrip("\\/")
+    if any(r == e or r.startswith(e + "\\") for e in exclude):
+        raise RuntimeError("Эта папка в списке «Не трогать никогда» — уберите её оттуда в настройках, если хотите разобрать")
     items: list[Item] = []
     locked: list[dict] = []
     skipped: dict[str, list[str]] = defaultdict(list)
@@ -255,6 +261,10 @@ def scan(root: Path, unskip: set[str]) -> Scan:
                 html_with_files.add(str(e))
         for e in entries:
             if e.name.lower() in SKIP_NAMES or e.name.startswith("~$"):
+                continue
+            if str(e).lower().rstrip("\\/") in exclude:
+                skipped["excluded"].append(e.name)
+                counts["excluded"] += count_files(e) if e.is_dir() else 1
                 continue
             if e.is_dir():
                 if e.name.endswith("_files") and any(str(d / (e.name[:-6] + x)) in html_with_files for x in (".html", ".htm")):
@@ -307,7 +317,7 @@ def scan_summary(sc: Scan) -> dict:
             n = sc.skipped_counts.get(key, 0)
             if not n:
                 continue
-            if key == "webpages":
+            if key in ("webpages", "excluded"):
                 ex = ", ".join(names[:4]) or f"{n} файлов"
             else:
                 exts = Counter(Path(x).suffix.lower() for x in names)
@@ -605,6 +615,66 @@ class Engine:
         self.stop = threading.Event()
         self.job: threading.Thread | None = None
         self.ctx: dict | None = None  # последний анализ: items, clusters, scan, options
+        self.learned_path = data_dir / "learned.json"
+        self.learned: list[dict] = []
+        try:
+            for e in json.loads(self.learned_path.read_text("utf-8")):
+                self.learned.append({**e, "v": np.array(e["v"], dtype=np.float32)})
+        except Exception:
+            self.learned = []
+
+    # ─── обучение на правках ───
+    def save_learned(self):
+        try:
+            self.learned_path.parent.mkdir(parents=True, exist_ok=True)
+            data = [{k: (v.tolist() if k == "v" else v) for k, v in e.items()} for e in self.learned]
+            self.learned_path.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+
+    def learn(self, req: dict) -> dict:
+        """Пользователь перетащил файлы в папку и нажал «Запомнить»: запоминаем их отпечатки и папку."""
+        if not self.ctx:
+            raise RuntimeError("План устарел — запустите анализ папки заново")
+        folder = str(req.get("folder", "")).strip().strip("/")
+        ids = set(int(i) for i in req.get("ids") or [])
+        items = [it for it in self.ctx["items"] if it.id in ids]
+        need = [it for it in items if it.vec is None]
+        if need:
+            arr = embed([embed_text(it) for it in need])
+            for it, v in zip(need, arr):
+                it.vec = v
+        for it in items:
+            self.learned = [e for e in self.learned if e.get("label") != it.path.name]  # повторная правка — переучиваем
+            self.learned.append({"v": np.asarray(it.vec, dtype=np.float32), "folder": folder, "label": it.path.name,
+                                 "at": dt.date.today().isoformat()})
+        self.learned = self.learned[-500:]
+        self.save_learned()
+        self.ctx["learned"] = self.learned
+        return {"count": len(self.learned)}
+
+    def learned_info(self) -> dict:
+        folders = Counter(e["folder"] for e in self.learned)
+        return {"count": len(self.learned), "folders": [{"folder": f, "n": n} for f, n in folders.most_common(8)]}
+
+    def learned_reset(self) -> dict:
+        self.learned = []
+        self.save_learned()
+        if self.ctx:
+            self.ctx["learned"] = []
+        return {"count": 0}
+
+    def replan(self, req: dict) -> dict:
+        """Правила или проекты поменялись — пересобираем текущий план без модели."""
+        if not self.ctx:
+            raise RuntimeError("План устарел — запустите анализ папки заново")
+        ctx = self.ctx
+        ctx["rules"] = req.get("rules") or []
+        ctx["projects_user"] = req.get("projects") or []
+        mapping = dict(req.get("mapping") or ctx["mapping"])
+        naming = dict(req.get("naming") or ctx["naming"])
+        plan = build_plan(ctx, mapping, naming)
+        return {"files": plan["files"], "projects": plan["projects"]}
 
     # ─── описание одного файла ───
     def describe(self, it: Item, model: str, lang: str) -> None:
@@ -625,6 +695,8 @@ class Engine:
                 it.date, it.date_src = d, "текст на картинке"
         elif it.kind == "doc":
             text = doc_text(it)
+            if text.strip():
+                it.meta["text"] = text[:1500]  # для поиска ключевых слов проектов и правил
             scan_b64 = it.meta.pop("scan_b64", None)
             if scan_b64:  # PDF-скан без текста — смотрим на первую страницу глазами
                 prompt = IMG_PROMPT.format(name=it.path.name, folder=folder, w=0, h=0, cam="", lang=lang_line(lang))
@@ -656,10 +728,11 @@ class Engine:
         naming = req.get("naming") or {"rename": True, "datePrefix": True, "lang": "ru", "maxWords": 0}
         wishes = (req.get("wishes") or "").strip()
         unskip = set(req.get("unskip") or [])
+        exclude = set(req.get("exclude") or [])
         self.paused.clear()
         self.stop.clear()
         try:
-            sc = scan(root, unskip)
+            sc = scan(root, unskip, exclude)
             items = sc.items
             emit({"event": "stage", "stage": 1})
             total = len(items)
@@ -734,11 +807,12 @@ class Engine:
             use = [it for it in processed if it.ai]
             emit({"event": "stage", "stage": 2})
             self.ctx = {"scan": sc, "items": use, "root": root, "dest": dest, "model": model, "naming": naming, "wishes": wishes,
-                        "partial": stopped_early and len(use) < total}
+                        "partial": stopped_early and len(use) < total, "rules": req.get("rules") or [],
+                        "projects_user": req.get("projects") or [], "learned": self.learned}
             clusters = cluster_items(use)
             self.ctx["clusters"] = clusters
             emit({"event": "stage", "stage": 3})
-            mapping, projects = plan_mapping(model, wishes, clusters, naming)
+            mapping, projects = plan_mapping(model, wishes, clusters, naming, [p.get("name", "") for p in self.ctx["projects_user"]])
             self.ctx["mapping"] = mapping
             self.ctx["projects"] = projects
             emit({"event": "plan", "plan": build_plan(self.ctx, mapping, naming)})
@@ -754,6 +828,10 @@ class Engine:
         model = MODELS.get(req.get("model", "accurate"), ctx["model"])
         mapping = dict(req.get("mapping") or ctx["mapping"])
         naming = dict(req.get("naming") or ctx["naming"])
+        if "rules" in req:
+            ctx["rules"] = req.get("rules") or []
+        if "projects" in req:
+            ctx["projects_user"] = req.get("projects") or []
         quick = quick_tune(req.get("text", ""), mapping, naming, ctx["clusters"])
         if quick:
             reply, mapping, naming = quick
@@ -1022,6 +1100,10 @@ def semantic(items: list[Item], vecs: np.ndarray, threshold: float = 0.32) -> li
     return list(g.values())
 
 
+def embed_text(i: Item) -> str:
+    return f"{i.ai.get('kind', '')}. Тема: {i.ai.get('topic', '')}. {i.ai.get('description', '')} {i.ai.get('text_on_image', '')} Файл: {i.path.stem}"[:700]
+
+
 def cluster_items(items: list[Item]) -> dict[str, list[Item]]:
     by_cat = defaultdict(list)
     for it in items:
@@ -1030,10 +1112,12 @@ def cluster_items(items: list[Item]) -> dict[str, list[Item]]:
     need = [it for it in items if it.category not in ("photo",) and not it.category.startswith("rule:")]
     vecs: dict[int, np.ndarray] = {}
     if need:
-        texts = [f"{i.ai.get('kind', '')}. Тема: {i.ai.get('topic', '')}. {i.ai.get('description', '')} {i.ai.get('text_on_image', '')} Файл: {i.path.stem}"[:700] for i in need]
+        texts = [embed_text(i) for i in need]
         try:
             arr = embed(texts)
             vecs = {it.id: v for it, v in zip(need, arr)}
+            for it, v in zip(need, arr):
+                it.vec = v
         except Exception:
             vecs = {}
     clusters: dict[str, list[Item]] = {}
@@ -1214,11 +1298,17 @@ def project_hints(items: list[Item]) -> list[tuple[str, int]]:
     return out[:8]
 
 
-def plan_mapping(model: str, wishes: str, clusters: dict[str, list[Item]], naming: dict) -> tuple[dict[str, str], list[str]]:
+def plan_mapping(model: str, wishes: str, clusters: dict[str, list[Item]], naming: dict,
+                 user_projects: list[str] | None = None) -> tuple[dict[str, str], list[str]]:
     all_items = [i for g in clusters.values() for i in g]
-    hints = project_hints(all_items)
+    mine = [p.strip() for p in user_projects or [] if p and p.strip()]
+    hints = [(n, k) for n, k in project_hints(all_items) if norm_key(n) not in {norm_key(p) for p in mine}]
     hint_line = ("Подсказка: эти названия повторяются в нескольких файлах — возможно, это проекты пользователя (используй их как названия папок проектов, если это действительно проекты): "
                  + ", ".join(f"{n} ({k} файла)" for n, k in hints)) if hints else ""
+    if mine:
+        root = "Projects" if naming.get("lang") == "en" else "Проекты"
+        hint_line = (f"Проекты пользователя (он сам их назвал): {', '.join(mine)}. Файлы этих проектов клади в «{root}/<название>», "
+                     f"название пиши ровно так, как здесь.\n" + hint_line).strip()
     lines = []
     for cid, g in clusters.items():
         cat = g[0].category
@@ -1308,6 +1398,137 @@ def tidy_path(path: str, it: Item, en: bool) -> str:
     return "/".join(segs)
 
 
+# ───────────────────── правила, проекты и выученное: решают раньше модели ─────────────────────
+
+LEARN_SIM = 0.80  # насколько файл должен быть похож на запомненный (bge-m3: чужие ~0.5–0.72, одно событие ~0.8+, копии ~0.97)
+WORD = "0-9a-zа-я"
+TYPE_RULE = {"photo": "Фото", "screenshot": "Скриншоты", "image": "Картинки", "doc": "Документы", "pdf": "PDF",
+             "table": "Таблицы", "video": "Видео", "audio": "Аудио"}
+
+
+def norm_text(s: str) -> str:
+    s = re.sub(r"([a-zа-я])([A-ZА-Я])", r"\1 \2", s)  # SimPie → sim pie
+    s = s.lower().replace("ё", "е")
+    return re.sub(r"[^0-9a-zа-я*?]+", " ", s).strip()
+
+
+def kw_hit(kw: str, text: str) -> bool:
+    """Ключевое слово в тексте: с начала слова, окончания любые («термоленд» найдёт «Термоленда»);
+    короткие слова — только целиком; длинные — и без пробелов («sim pie» = «SimPie»)."""
+    k = norm_text(kw).replace("*", " ").replace("?", " ").strip()
+    if len(k) < 2:
+        return False
+    flat = k.replace(" ", "")
+    if len(flat) >= 5 and flat in text.replace(" ", ""):
+        return True
+    tail = "" if len(k) >= 4 else f"(?![{WORD}])"
+    return re.search(f"(?<![{WORD}])" + re.escape(k) + tail, text) is not None
+
+
+def about_text(it: Item) -> str:
+    """О чём файл: имя, папка, тема и описание от модели, текст на картинке. По нему узнаём проекты:
+    случайное упоминание проекта где-то в теле документа сюда не попадает."""
+    return norm_text(" ".join([it.path.stem, it.from_rel, it.ai.get("topic", ""), it.ai.get("suggested_name", ""),
+                               it.ai.get("description", ""), it.ai.get("text_on_image", "")]))
+
+
+def content_text(it: Item) -> str:
+    """Всё, что известно о содержимом, включая текст документа, — для правил «Текст содержит»."""
+    if it.kind == "doc" and "text" not in it.meta:
+        try:  # описание пришло из кэша без текста — дочитываем
+            it.meta["text"] = doc_text(it, 1500)
+        except Exception:
+            it.meta["text"] = ""
+    return about_text(it) + " " + norm_text(it.meta.get("text", ""))
+
+
+def type_hit(value: str, it: Item) -> bool:
+    v = value.strip().lower()
+    tp = type_of(it)[0]
+    if v == "photo":
+        return tp == "фото"
+    if v == "screenshot":
+        return tp == "скриншот"
+    if v == "image":
+        return it.kind == "image"
+    if v == "doc":
+        return it.kind == "doc" or tp == "скан"
+    if v == "pdf":
+        return it.ext == ".pdf"
+    if v == "table":
+        return it.ext in (".xlsx", ".xls", ".csv", ".ods")
+    if v in ("video", "audio"):
+        return it.kind == v
+    exts = {"." + e.strip(" .*") for e in re.split(r"[,\s;]+", v) if e.strip(" .*")}
+    return it.ext in exts
+
+
+def rule_hit(rule: dict, it: Item, cache: dict) -> bool:
+    field_, value = rule.get("field", "name"), str(rule.get("value", "")).strip()
+    if not value:
+        return False
+    if field_ == "type":
+        return type_hit(value, it)
+    if field_ == "name":
+        if "*" in value or "?" in value:
+            import fnmatch
+            return any(fnmatch.fnmatch(it.path.name.lower(), v.strip().lower()) for v in value.split(",") if v.strip())
+        text = norm_text(it.path.name)
+    elif field_ == "from":
+        text = norm_text(it.from_rel + " " + str(it.path.parent))
+    else:
+        if it.id not in cache:
+            cache[it.id] = content_text(it)
+        text = cache[it.id]
+    return any(kw_hit(v, text) for v in value.split(",") if v.strip())
+
+
+def overrides(ctx: dict, items: list[Item], en: bool) -> dict[int, dict]:
+    """Куда файл кладётся без модели: правила пользователя → его проекты → выученные примеры."""
+    rules = [r for r in ctx.get("rules") or [] if str(r.get("folder", "")).strip() and str(r.get("value", "")).strip()]
+    projects = [p for p in ctx.get("projects_user") or [] if str(p.get("name", "")).strip()]
+    learned = ctx.get("learned") or []
+    out: dict[int, dict] = {}
+    cache: dict[int, str] = {}
+    lv = np.stack([e["v"] for e in learned]) if learned else None
+    proj_root = "Projects" if en else "Проекты"
+    for it in items:
+        if it.kind == "rule":
+            continue
+        for r in rules:
+            if rule_hit(r, it, cache):
+                what = {"name": "имя", "text": "текст", "from": "откуда", "type": "тип"}.get(r.get("field"), "")
+                val = TYPE_RULE.get(r["value"], r["value"]) if r.get("field") == "type" else r["value"]
+                out[it.id] = {"path": r["folder"], "rename": r.get("rename") or "auto", "src": "rule",
+                              "why": f"Ваше правило: {what} — «{val}» → «{r['folder'].strip().strip('/').replace('{year}', 'год')}»."}
+                break
+        if it.id in out:
+            continue
+        if projects:
+            text = about_text(it)
+            for p in projects:
+                words = [p["name"]] + [k for k in p.get("keywords") or [] if str(k).strip()]
+                hit = next((w for w in words if kw_hit(str(w), text)), None)
+                if hit:
+                    out[it.id] = {"path": f"{proj_root}/{p['name'].strip()}", "rename": "auto", "src": "project",
+                                  "why": f"Ваш проект «{p['name'].strip()}»: в файле есть «{str(hit).strip()}»."}
+                    break
+        if it.id in out or lv is None or it.vec is None:
+            continue
+        sims = lv @ np.asarray(it.vec, dtype=np.float32)
+        order = np.argsort(-sims)
+        k = int(order[0])
+        rival = next((float(sims[j]) for j in order[1:] if learned[j]["folder"] != learned[k]["folder"]), 0.0)
+        if sims[k] >= LEARN_SIM and sims[k] - rival > 0.02:  # два примера из разных папок почти одинаково близки — не угадываем
+            e = learned[k]
+            why = (f"Вы переложили этот файл в «{e['folder']}» и попросили запомнить." if e["label"] == it.path.name
+                   else f"Похож на «{e['label']}» — его вы переложили в «{e['folder']}».")
+            out[it.id] = {"path": e["folder"], "rename": "auto", "src": "learned", "why": why}
+    for o in out.values():
+        o["path"] = "/".join(clean_name(s, 60) for s in str(o["path"]).replace("\\", "/").split("/") if s.strip() and s.strip() not in (".", ".."))
+    return {k: v for k, v in out.items() if v["path"]}
+
+
 def build_plan(ctx: dict, mapping: dict[str, str], naming: dict) -> dict:
     items: list[Item] = ctx["items"]
     clusters: dict[str, list[Item]] = ctx["clusters"]
@@ -1316,6 +1537,7 @@ def build_plan(ctx: dict, mapping: dict[str, str], naming: dict) -> dict:
     dest: Path = ctx["dest"]
     en = naming.get("lang") == "en"
     versions = version_groups(items)
+    forced = overrides(ctx, items, en)
     files = []
     taken: set[str] = set()
 
@@ -1338,9 +1560,12 @@ def build_plan(ctx: dict, mapping: dict[str, str], naming: dict) -> dict:
     # проход 1: куда кладём каждый файл
     target: dict[int, str] = {}
     for it in items:
-        path = mapping.get(it.cluster) or "Разобрать вручную"
         year = it.date[:4] if it.date and not is_unreliable_photo(it) else ""
         nodate = "No date" if en else "Без даты"
+        if it.id in forced:  # правило, проект или выученный пример — как сказал пользователь
+            target[it.id] = forced[it.id]["path"].replace("{{year}}", year or nodate).replace("{year}", year or nodate)
+            continue
+        path = mapping.get(it.cluster) or "Разобрать вручную"
         path = path.replace("{{year}}", year or nodate).replace("{year}", year or nodate)
         path = tidy_path(path, it, en)
         parts = path.split("/")
@@ -1369,7 +1594,7 @@ def build_plan(ctx: dict, mapping: dict[str, str], naming: dict) -> dict:
     counts = Counter(target.values())
     for iid, p in list(target.items()):
         segs = p.split("/")
-        keep = segs[0] in ("Проекты", "Projects", "Фото", "Photos") or p.startswith(("Документы/Личные", "Documents/Personal"))
+        keep = segs[0] in ("Проекты", "Projects", "Фото", "Photos") or p.startswith(("Документы/Личные", "Documents/Personal")) or iid in forced
         if counts[p] == 1 and len(segs) >= 2 and not keep:
             target[iid] = "/".join(segs[:-1])
 
@@ -1386,10 +1611,16 @@ def build_plan(ctx: dict, mapping: dict[str, str], naming: dict) -> dict:
         check = None
         reason = (it.ai.get("description") or "").strip()
         path = target[it.id]
+        fo = forced.get(it.id)
         if path.startswith(("Документы/Личные", "Documents/Personal")) and it.ai.get("sensitive"):
             reason += " Личные данные — в отдельную папку, превью размыто."
         name = proposed_name(it, naming)
-        if it.id in event_idx and naming.get("rename", True):
+        if fo and fo["rename"] == "keep":
+            name = it.path.name
+        elif fo and fo["rename"] == "date":
+            stem = os.path.splitext(name)[0]
+            name = (stem if stem.startswith(it.date) else f"{it.date} {stem}") + it.ext
+        if it.id in event_idx and naming.get("rename", True) and not (fo and fo["rename"] != "auto"):
             k, n = event_idx[it.id]
             leaf = re.sub(r"^\d{4}\s*[—\-–]\s*", "", path.split("/")[-1]).strip() or "Событие"
             if leaf.lower() not in ("без даты", str(it.date[:4])):
@@ -1419,19 +1650,24 @@ def build_plan(ctx: dict, mapping: dict[str, str], naming: dict) -> dict:
             date_disp, dsrc = f"{d[8:10]}.{d[5:7]}.{d[:4]}?", "EXIF, ненадёжно"
             check = check or "Дата ненадёжна: часы камеры были сброшены"
             conf = min(conf, 58)
-        if conf < 40 and path != "Разобрать вручную":
-            path = "Разобрать вручную"
-        if path == "Разобрать вручную":
-            conf = min(conf, 39)
-            check = check or "Модель не уверена, куда положить"
-        elif conf < 55:
-            check = check or "Модель не уверена, куда положить"
+        if fo:  # решение пользователя — без «модель не уверена»
+            reason = fo["why"] + (" " + reason if reason else "")
+            conf = max(conf, 97)
+        else:
+            if conf < 40 and path != "Разобрать вручную":
+                path = "Разобрать вручную"
+            if path == "Разобрать вручную":
+                conf = min(conf, 39)
+                check = check or "Модель не уверена, куда положить"
+            elif conf < 55:
+                check = check or "Модель не уверена, куда положить"
         name = unique(path, name)
         files.append({
             "id": it.id, "abs": str(it.path), "cur": str(it.path), "old": it.path.name, "fromRel": it.from_rel,
             "name": name, "orig": name, "to": path, "engineTo": path, "type": tp, "icon": icon, "reason": reason.strip(),
             "date": date_disp, "dsrc": dsrc, "conf": conf, "check": check, "priv": bool(it.ai.get("sensitive")),
             "thumb": it.thumb, "kind": it.kind if it.kind != "rule" else "doc", "cluster": it.cluster, "size": it.size, "rejected": False,
+            "by": fo["src"] if fo else None,
         })
     skipped = sum(sc.skipped_counts.values())
     same = str(dest).rstrip("\\/").lower() == str(root).rstrip("\\/").lower()
@@ -1465,7 +1701,7 @@ def main():
             if cmd == "ping":
                 res = {"pong": True}
             elif cmd == "scan":
-                res = scan_summary(scan(Path(req["root"]), set(req.get("unskip") or [])))
+                res = scan_summary(scan(Path(req["root"]), set(req.get("unskip") or []), set(req.get("exclude") or [])))
             elif cmd == "analyze":
                 if eng.job and eng.job.is_alive():
                     eng.stop.set()
@@ -1484,6 +1720,14 @@ def main():
                 res = eng.tune(req)
             elif cmd == "describe_image":
                 res = eng.describe_image(req)
+            elif cmd == "learn":
+                res = eng.learn(req)
+            elif cmd == "replan":
+                res = eng.replan(req)
+            elif cmd == "learned_info":
+                res = eng.learned_info()
+            elif cmd == "learned_reset":
+                res = eng.learned_reset()
             else:
                 raise RuntimeError(f"неизвестная команда {cmd}")
             emit({"id": rid, "ok": True, "result": res})

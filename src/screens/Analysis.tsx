@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Ic, css, useTicker } from "../ui";
-import { gpuWait, set, showPlanNow, startAnalysis, toggleAnalysisPause, useApp } from "../store";
+import { gpuResume, gpuWait, set, showPlanNow, startAnalysis, toggleAnalysisPause, useApp } from "../store";
 import { api, fileSrc } from "../lib/api";
 import type { CurrentFile } from "../lib/types";
 import { fmtEta, fmtSec, nf, plural } from "../lib/format";
@@ -78,6 +78,13 @@ export function Analysis() {
             <span style={css("flex:1;font:400 13px 'Onest';color:#d6d6d9")}><b style={css("font-weight:500;color:oklch(0.88 0.12 85)")}>Видеокарта занята ({gpuApp})</b> — {slowText}</span>
             <button onClick={gpuWait} style={css("height:30px;padding:0 11px;border-radius:7px;border:1px solid #2e2e32;background:#1c1c1f;color:#ededee;font:500 12px 'Onest';cursor:pointer")}>Пауза до выхода из игры</button>
             <button onClick={() => set({ gpuChoice: "slow" })} style={css("height:30px;padding:0 11px;border-radius:7px;border:none;background:transparent;color:#9a9aa0;font:500 12px 'Onest';cursor:pointer")}>Продолжить медленно</button>
+          </div>
+        )}
+        {busy && s.gpuChoice === "wait" && (
+          <div style={css("display:flex;align-items:center;gap:12px;padding:10px 12px 10px 14px;border-radius:11px;background:#141416;border:1px solid #26262a;animation:fadein .3s ease both")}>
+            <Ic n="pause_circle" s="font-size:20px;color:#c9c9cd" />
+            <span style={css("flex:1;font:400 13px 'Onest';color:#d6d6d9")}><b style={css("font-weight:500;color:#ededee")}>Пауза: видеокарта занята ({gpuApp})</b> — продолжу сам, когда игра закроется</span>
+            <button onClick={gpuResume} style={css("height:30px;padding:0 11px;border-radius:7px;border:1px solid #2e2e32;background:#1c1c1f;color:#ededee;font:500 12px 'Onest';cursor:pointer")}>Продолжить сейчас</button>
           </div>
         )}
         <div style={css("display:flex;align-items:center;gap:8px")}>

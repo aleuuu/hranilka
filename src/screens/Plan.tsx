@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { C, Ic, css, topColor } from "../ui";
 import {
-  AppState, LOCKED_DIR, get, moveFile, planStats, renameFile, restoreName, set, toggleReject, undoEdit, useApp,
+  AppState, LOCKED_DIR, get, moveFile, planStats, rememberMove, rememberProjects, renameFile, restoreName, set, toggleReject, undoEdit, useApp,
 } from "../store";
 import type { FileItem } from "../lib/types";
 import { nf, plural, winJoin } from "../lib/format";
@@ -65,11 +65,11 @@ export function Plan() {
     return () => window.removeEventListener("keydown", onK);
   }, []);
 
-  // Тост гаснет через 4.5 с
+  // Тост гаснет через 4.5 с (с кнопкой «Запомнить» — чуть дольше, чтобы успеть нажать)
   useEffect(() => {
-    if (!s.toast) return;
+    if (!s.toast || s.toast.busy) return;
     const at = s.toast.at;
-    const tm = setTimeout(() => { if (get().toast?.at === at) set({ toast: null }); }, 4500);
+    const tm = setTimeout(() => { if (get().toast?.at === at) set({ toast: null }); }, s.toast.learn != null ? 8000 : 4500);
     return () => clearTimeout(tm);
   }, [s.toast]);
 
@@ -263,6 +263,9 @@ export function Plan() {
             <div style={css("margin:0 10px 8px;display:flex;align-items:center;gap:10px;padding:9px 10px 9px 12px;border-radius:10px;background:oklch(0.74 0.15 300 / 0.08);border:1px solid oklch(0.74 0.15 300 / 0.25)")}>
               <Ic n="workspaces" s="font-size:18px;color:oklch(0.8 0.13 300)" />
               <span style={css("flex:1;font:400 12px/1.35 'Onest';color:#d6d6d9")}>Нашли ваши проекты: {plan.projects.join(", ")} — сделали для них отдельные папки</span>
+              {plan.projects.some((p) => !s.settings.projects.some((x) => x.name.toLowerCase() === p.toLowerCase())) && (
+                <button onClick={rememberProjects} title="Запомнить в «Правилах»: файлы этих проектов всегда будут ложиться в их папки" style={css("height:26px;padding:0 9px;border-radius:6px;border:none;background:oklch(0.74 0.15 300 / 0.22);color:#ededee;font:500 11px 'Onest';cursor:pointer;white-space:nowrap")}>Запомнить проекты</button>
+              )}
               <button onClick={() => set({ projBanner: false })} style={css("height:26px;padding:0 9px;border-radius:6px;border:none;background:#1f1f23;color:#ededee;font:500 11px 'Onest';cursor:pointer")}>Хорошо</button>
             </div>
           )}
@@ -321,9 +324,15 @@ export function Plan() {
       </div>
       {s.toast && (
         <div style={css("position:absolute;left:50%;bottom:20px;transform:translateX(-50%);display:flex;align-items:center;gap:12px;height:42px;padding:0 6px 0 14px;border-radius:11px;background:#1f1f22;border:1px solid #2e2e33;box-shadow:0 12px 40px rgba(0,0,0,.5);animation:pop .3s cubic-bezier(.2,.8,.2,1) both;white-space:nowrap;z-index:5")}>
-          <Ic n="check" s="font-size:17px;color:oklch(0.85 0.14 155)" />
+          {s.toast.busy ? <span style={css("width:15px;height:15px;border-radius:50%;border:2px solid #3a3a3f;border-top-color:#ededee;animation:spin .8s linear infinite;flex:none")} /> : <Ic n="check" s="font-size:17px;color:oklch(0.85 0.14 155)" />}
           <span style={css("font:400 13px 'Onest';color:#ededee;max-width:520px;overflow:hidden;text-overflow:ellipsis")}>{s.toast.text}</span>
-          <button onClick={undoEdit} style={css("height:30px;padding:0 10px;border-radius:7px;border:none;background:#2a2a2e;color:#ededee;font:500 12px 'Onest';cursor:pointer")}>Отменить</button>
+          {s.toast.learn != null && (
+            <button onClick={() => rememberMove(s.toast!.learn!)} title="Похожие файлы будут ложиться в эту папку сами — и сейчас, и в следующих сортировках"
+              style={css("height:30px;padding:0 10px;border-radius:7px;border:none;background:oklch(0.72 0.15 155 / 0.18);color:oklch(0.9 0.1 155);font:500 12px 'Onest';cursor:pointer;display:flex;align-items:center;gap:5px")}>
+              <Ic n="school" s="font-size:15px" />Запомнить
+            </button>
+          )}
+          {!s.toast.busy && <button onClick={undoEdit} style={css("height:30px;padding:0 10px;border-radius:7px;border:none;background:#2a2a2e;color:#ededee;font:500 12px 'Onest';cursor:pointer")}>Отменить</button>}
         </div>
       )}
       {ghost && (

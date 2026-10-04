@@ -19,7 +19,7 @@ function TitleBar() {
       <div style={css("display:flex")}>
         <B as="button" onClick={() => api.win("minimize")} s={btn + ";font-size:16px"} h="background:#18181b;color:#ededee"><span data-ms="">remove</span></B>
         <B as="button" onClick={() => api.win("maximize")} s={btn + ";font-size:14px"} h="background:#18181b;color:#ededee"><span data-ms="">crop_square</span></B>
-        <B as="button" onClick={() => api.win("close")} s={btn + ";font-size:16px"} h="background:#c42b1c;color:#fff"><span data-ms="">close</span></B>
+        <B as="button" onClick={() => api.win("close")} s={btn + ";font-size:16px"} h="background:#c42b1c;color:#fefefe"><span data-ms="">close</span></B>
       </div>
     </div>
   );

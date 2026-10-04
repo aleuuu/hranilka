@@ -52,6 +52,31 @@ pub async fn models(base: &str) -> Vec<String> {
     v["models"].as_array().map(|a| a.iter().filter_map(|m| m["name"].as_str().map(String::from)).collect()).unwrap_or_default()
 }
 
+/// Модели с размерами — для страницы «Модели».
+pub async fn models_detail(base: &str) -> Vec<Value> {
+    let Ok(r) = client(Duration::from_secs(4)).get(format!("{base}/api/tags")).send().await else { return vec![] };
+    let Ok(v) = r.json::<Value>().await else { return vec![] };
+    v["models"]
+        .as_array()
+        .map(|a| a.iter().map(|m| json!({ "name": m["name"], "size": m["size"], "modified": m["modified_at"] })).collect())
+        .unwrap_or_default()
+}
+
+pub async fn version(base: &str) -> Option<String> {
+    let r = client(Duration::from_millis(1500)).get(format!("{base}/api/version")).send().await.ok()?;
+    r.json::<Value>().await.ok()?["version"].as_str().map(String::from)
+}
+
+pub async fn delete(base: &str, name: &str) -> Result<(), String> {
+    let r = client(Duration::from_secs(30))
+        .delete(format!("{base}/api/delete"))
+        .json(&json!({ "model": name }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if r.status().is_success() { Ok(()) } else { Err(format!("Ollama не удалила модель: {}", r.status())) }
+}
+
 /// Запускает Ollama, если она установлена и не отвечает. Для своей папки моделей — отдельный сервер на 11435.
 pub async fn ensure_running(base: &str, custom_dir: Option<PathBuf>, wait_secs: u64) -> Result<(), String> {
     if running(base).await {
