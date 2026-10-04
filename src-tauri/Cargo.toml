@@ -1,0 +1,33 @@
+[package]
+name = "hranilka"
+version = "0.1.0"
+description = "Хранилка — наводит порядок в фото и документах с помощью локальной модели"
+authors = ["Хранилка"]
+edition = "2021"
+
+[lib]
+# Суффикс _lib нужен, чтобы имя библиотеки не конфликтовало с бинарником на Windows
+name = "hranilka_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures-util = "0.3"
+chrono = "0.4"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
