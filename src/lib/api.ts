@@ -23,6 +23,8 @@ export interface Api {
   analysisStop(): Promise<void>;
   tune(req: { text: string; history: TuneMsg[]; mapping: Record<string, string>; naming: Naming; wishes: string; model: ModelKey; rules: Rule[]; projects: Project[] }): Promise<TuneReply>;
   learn(ids: number[], folder: string): Promise<{ count: number }>;
+  similar(id: number): Promise<{ ids: number[] }>;
+  pickFiles(defaultPath?: string): Promise<string[]>;
   replan(req: { rules: Rule[]; projects: Project[]; mapping: Record<string, string>; naming: Naming }): Promise<{ files: FileItem[]; projects: string[] }>;
   learnedInfo(): Promise<{ count: number; folders: { folder: string; n: number }[] }>;
   learnedReset(): Promise<{ count: number }>;
@@ -84,6 +86,12 @@ function tauriApi(): Api {
     analysisStop: () => engine({ cmd: "stop_and_plan" }),
     tune: (req) => engine({ cmd: "tune", ...req }),
     learn: (ids, folder) => engine({ cmd: "learn", ids, folder }),
+    similar: (id) => engine({ cmd: "similar", file: id }),
+    pickFiles: async (defaultPath) => {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const r = await open({ multiple: true, directory: false, defaultPath, title: "Файлы-примеры для папки" });
+      return Array.isArray(r) ? r : typeof r === "string" ? [r] : [];
+    },
     replan: (req) => engine({ cmd: "replan", ...req }),
     learnedInfo: () => engine({ cmd: "learned_info" }),
     learnedReset: () => engine({ cmd: "learned_reset" }),

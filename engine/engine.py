@@ -189,6 +189,10 @@ class Scan:
     skipped_counts: Counter
     root_files: int
     root_kinds: list[str]
+    subdirs: list[dict] = field(default_factory=list)          # папки верхнего уровня — для «Взять из папки»
+    examples: dict[str, list[Path]] = field(default_factory=dict)  # папка структуры -> файлы, которые там уже лежат
+    target_counts: Counter = field(default_factory=Counter)
+    structure: bool = False
 
 
 def code_why(p: Path) -> str:
@@ -219,8 +223,50 @@ def count_files(p: Path, limit=100000) -> int:
     return n
 
 
-def scan(root: Path, unskip: set[str], exclude: set[str] | None = None) -> Scan:
+def structure_paths(tree: list[dict] | None) -> dict[str, str]:
+    """Пути папок своей структуры: «картинки/мемы» -> «Картинки/Мемы»."""
+    out: dict[str, str] = {}
+
+    def go(nodes, prefix):
+        for n in nodes or []:
+            nm = clean_name(str(n.get("name") or "").strip(), 60) if str(n.get("name") or "").strip() else ""
+            if not nm:
+                continue
+            p = f"{prefix}/{nm}" if prefix else nm
+            out.setdefault(p.lower(), p)
+            go(n.get("kids"), p)
+    go(tree, "")
+    return out
+
+
+def scan(root: Path, unskip: set[str], exclude: set[str] | None = None, structure: list[dict] | None = None) -> Scan:
+    """structure — дерево папок пользователя (режим «По моей структуре»): тогда в разбор идут все файлы, кроме недокачанных,
+    папки из структуры не трогаем (их файлы — примеры), остальные вложенные папки уходят в «Разобрать вручную» целиком."""
     exclude = {e.lower().rstrip("\\/") for e in (exclude or set())}
+    smode = structure is not None
+    targets = structure_paths(structure) if smode else {}
+    subdirs: list[dict] = []
+    examples: dict[str, list[Path]] = defaultdict(list)
+    target_counts: Counter = Counter()
+
+    def sample_examples(d: Path, node_path: str, rel: str):
+        n = 0
+        try:
+            for e in sorted(d.iterdir(), key=lambda x: x.name.lower()):
+                child = f"{rel}/{e.name}"
+                if e.is_dir():
+                    if child.lower() in targets:
+                        sample_examples(e, targets[child.lower()], child)
+                    continue
+                c = file_category(e.suffix.lower())
+                if c == "temp" or e.name.lower() in SKIP_NAMES:
+                    continue
+                n += 1
+                if c in {"image", "doc", "video", "audio"} and len(examples[node_path]) < 6:
+                    examples[node_path].append(e)
+        except OSError:
+            pass
+        target_counts[node_path] += n
     if not root.exists() or not root.is_dir():
         raise RuntimeError("Папка не найдена или недоступна")
     parts = [p.lower() for p in root.resolve().parts]
@@ -248,7 +294,7 @@ def scan(root: Path, unskip: set[str], exclude: set[str] | None = None) -> Scan:
         items.append(Item(id=nid, path=p, rel=str(p.relative_to(root)).replace("\\", "/"), kind=kind, size=st.st_size,
                           mtime=st.st_mtime, ext=p.suffix.lower(), rule=rule))
 
-    def walk(d: Path, depth: int):
+    def walk(d: Path, depth: int, rel: str = ""):
         nonlocal root_files
         try:
             entries = sorted(d.iterdir(), key=lambda x: x.name.lower())
@@ -267,17 +313,26 @@ def scan(root: Path, unskip: set[str], exclude: set[str] | None = None) -> Scan:
                 counts["excluded"] += count_files(e) if e.is_dir() else 1
                 continue
             if e.is_dir():
+                child = f"{rel}/{e.name}" if rel else e.name
+                if smode and child.lower() in targets:
+                    # папка уже есть в структуре — внутри всё разложено, её файлы станут примерами
+                    sample_examples(e, targets[child.lower()], child)
+                    if depth == 0:
+                        subdirs.append({"name": e.name, "n": target_counts[targets[child.lower()]], "kind": "target"})
+                    continue
                 if e.name.endswith("_files") and any(str(d / (e.name[:-6] + x)) in html_with_files for x in (".html", ".htm")):
                     if "webpages" in unskip:
-                        walk(e, depth + 1)
+                        walk(e, depth + 1, child)
                     else:
                         skipped["webpages"].append(e.name[:-6]); counts["webpages"] += count_files(e)
                     continue
                 cat = classify_folder(e)
+                if depth == 0 and cat:
+                    subdirs.append({"name": e.name, "n": count_files(e), "kind": cat})
                 if not cat:
-                    walk(e, depth + 1)
-                elif cat in unskip:
-                    walk(e, depth + 1)
+                    walk(e, depth + 1, child)
+                elif cat in unskip and not smode:
+                    walk(e, depth + 1, child)
                 else:
                     why = code_why(e) if cat == "code" else FOLDER_WHY[cat]
                     locked.append({"id": f"L{len(locked) + 1}", "name": e.name, "why": why, "rel": str(e.relative_to(root)).replace("\\", "/"),
@@ -294,13 +349,17 @@ def scan(root: Path, unskip: set[str], exclude: set[str] | None = None) -> Scan:
                 root_kinds.append({"image": "image", "doc": "doc", "video": "video", "audio": "video"}.get(cat, "manual"))
             if cat in {"image", "doc", "video", "audio"}:
                 add(e, cat)
-            elif cat in unskip:
+            elif cat == "temp" and smode:
+                # недокачанный файл не трогаем никогда — иначе сломается загрузка в браузере
+                skipped[cat].append(e.name); counts[cat] += 1
+            elif cat in unskip or smode:
                 add(e, "rule", cat)
             else:
                 skipped[cat].append(e.name); counts[cat] += 1
 
     walk(root, 0)
-    return Scan(root=root, items=items, locked=locked, skipped=skipped, skipped_counts=counts, root_files=root_files, root_kinds=root_kinds)
+    return Scan(root=root, items=items, locked=locked, skipped=skipped, skipped_counts=counts, root_files=root_files, root_kinds=root_kinds,
+                subdirs=subdirs, examples=dict(examples), target_counts=target_counts, structure=smode)
 
 
 def scan_summary(sc: Scan) -> dict:
@@ -324,10 +383,24 @@ def scan_summary(sc: Scan) -> dict:
                 ex = f"{n} {plural(n, ('файл', 'файла', 'файлов'))}: " + ", ".join(e for e, _ in exts.most_common(4) if e)
             cats.append({"key": key, "icon": icon, "label": label, "ex": ex, "count": n})
     skipped_files = sum(v for k, v in sc.skipped_counts.items())
+    sk = sc.skipped_counts
+    html = sum(1 for i in sc.items if i.kind == "doc" and i.ext in (".html", ".htm"))
+    rules = Counter(i.rule for i in sc.items if i.kind == "rule")
+    # разбивка для карточки папки: что вообще лежит в папке, независимо от того, что пропустим
+    breakdown = {
+        "html": html,
+        "instArch": sk.get("installers", 0) + sk.get("archives", 0) + rules["installers"] + rules["archives"],
+        "docs": kinds["doc"] - html,
+        "media": kinds["video"] + kinds["audio"],
+        "images": kinds["image"],
+        "other": sk.get("service", 0) + sk.get("other", 0) + rules["service"] + rules["other"],
+    }
     return {
         "root": str(sc.root), "rootDisplay": display_name(sc.root), "total": len(sc.items),
         "images": kinds["image"], "docs": kinds["doc"], "media": kinds["video"] + kinds["audio"],
         "lockedCount": len(sc.locked), "skippedFiles": skipped_files, "skipped": cats,
+        "breakdown": breakdown, "allFiles": sum(breakdown.values()), "partial": sk.get("temp", 0),
+        "subdirs": sc.subdirs,
     }
 
 
@@ -456,11 +529,15 @@ def name_is_broken(name: str) -> bool:
 
 # ───────────────────────────── модель ─────────────────────────────
 
-def ollama_chat(model: str, prompt: str, schema: dict | None, images: list[str] | None = None, retries: int = 2) -> tuple[dict, dict]:
+def ollama_chat(model: str, prompt: str, schema: dict | None, images: list[str] | None = None, retries: int = 2,
+                temperature: float = 0.2, seed: int | None = None) -> tuple[dict, dict]:
     msg = {"role": "user", "content": prompt}
     if images:
         msg["images"] = images
-    body = {"model": model, "messages": [msg], "stream": False, "options": {"temperature": 0.2, "num_ctx": CTX}, "keep_alive": "30m"}
+    options = {"temperature": temperature, "num_ctx": CTX}
+    if seed is not None:
+        options["seed"] = seed  # одинаковый ответ на одинаковый вопрос — план не прыгает от запуска к запуску
+    body = {"model": model, "messages": [msg], "stream": False, "options": options, "keep_alive": "30m"}
     if schema:
         body["format"] = schema
     last = None
@@ -673,8 +750,50 @@ class Engine:
         ctx["projects_user"] = req.get("projects") or []
         mapping = dict(req.get("mapping") or ctx["mapping"])
         naming = dict(req.get("naming") or ctx["naming"])
-        plan = build_plan(ctx, mapping, naming)
+        plan = make_plan(ctx, mapping, naming)
         return {"files": plan["files"], "projects": plan["projects"]}
+
+    def similar(self, req: dict) -> dict:
+        """Файлы плана, похожие на этот, — для «Разложить похожие» после перетаскивания."""
+        if not self.ctx:
+            raise RuntimeError("План устарел — запустите анализ папки заново")
+        items = self.ctx["items"]
+        it = next((i for i in items if i.id == int(req.get("file", -1))), None)  # не «id»: это поле занято номером запроса
+        if it is None or it.kind == "rule":
+            return {"ids": []}
+        if it.vec is None:
+            it.vec = embed([embed_text(it)])[0]
+        scored = [(float(np.dot(it.vec, o.vec)), o.id) for o in items
+                  if o.id != it.id and o.vec is not None and o.kind == it.kind]
+        return {"ids": [i for s, i in sorted(scored, reverse=True) if s >= SIMILAR_SIM][:60]}
+
+    def example_items(self, structure: list[dict], sc: Scan) -> tuple[list[Item], dict[int, str]]:
+        """Файлы-примеры для папок структуры: выбранные вручную и те, что уже лежат в этих папках. Не больше 6 на папку."""
+        pairs: list[tuple[Path, str]] = []
+        for n in flatten_structure(structure):
+            pairs += [(Path(p), n.path) for p in n.example_paths]
+        for node_path, paths in sc.examples.items():
+            pairs += [(p, node_path) for p in paths]
+        out: list[Item] = []
+        node_of: dict[int, str] = {}
+        per: Counter = Counter()
+        seen: set[str] = set()
+        k = EX_ID0
+        for p, node_path in pairs:
+            key = str(p).lower()
+            cat = file_category(p.suffix.lower())
+            if key in seen or per[node_path.lower()] >= 6 or cat not in {"image", "doc", "video", "audio"}:
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            seen.add(key)
+            per[node_path.lower()] += 1
+            k += 1
+            out.append(Item(id=k, path=p, rel=p.name, kind=cat, size=st.st_size, mtime=st.st_mtime, ext=p.suffix.lower()))
+            node_of[k] = node_path
+        return out[:48], node_of
 
     # ─── описание одного файла ───
     def describe(self, it: Item, model: str, lang: str) -> None:
@@ -729,13 +848,15 @@ class Engine:
         wishes = (req.get("wishes") or "").strip()
         unskip = set(req.get("unskip") or [])
         exclude = set(req.get("exclude") or [])
+        structure = req.get("structure") or None  # режим «По моей структуре»
         self.paused.clear()
         self.stop.clear()
         try:
-            sc = scan(root, unskip, exclude)
+            sc = scan(root, unskip, exclude, structure)
             items = sc.items
+            ex_items, ex_node = self.example_items(structure, sc) if structure else ([], {})
             emit({"event": "stage", "stage": 1})
-            total = len(items)
+            total = len(items) + len(ex_items)
             done, errors = 0, 0
             t0 = time.time()
             times: list[float] = []
@@ -754,7 +875,7 @@ class Engine:
                     topics[key.lower()] += 1
                     topic_kind[key.lower()][type_of(it)[0]] += 1
                     topic_kind[key.lower()]["__label__" + key] += 1
-                emit({"event": "file_done", "file": ui_file(it, naming)})
+                emit({"event": "file_done", "file": {**ui_file(it, naming), **({"feed": False} if it.id >= EX_ID0 else {})}})
                 spf = (time.time() - t0) / max(1, done - cached)
                 emit({"event": "progress", "done": done, "total": total, "errors": errors, "secPerFile": round(spf, 2) if done > cached else 0})
                 if done % 4 == 0 or done == total:
@@ -763,7 +884,7 @@ class Engine:
             # из кэша — сразу
             todo = []
             cached = 0
-            for it in items:
+            for it in items + ex_items:
                 c = self.cache.get(self.cache.key(it, model, lang))
                 if c:
                     it.ai, it.meta, it.date, it.date_src, it.thumb = c["ai"], c["meta"], c["date"], c["date_src"], c.get("thumb")
@@ -793,7 +914,7 @@ class Engine:
                         it.date, it.date_src = dt.date.fromtimestamp(it.mtime).isoformat(), "дата изменения"
                     return it, False
 
-            processed = [it for it in items if it.ai]
+            processed = [it for it in items + ex_items if it.ai]
             with ThreadPoolExecutor(WORKERS) as ex:
                 futs = [ex.submit(work, it) for it in todo]
                 for fu in as_completed(futs):
@@ -804,13 +925,42 @@ class Engine:
                     finish(it, ok)
             self.cache.save()
             stopped_early = self.stop.is_set()
-            use = [it for it in processed if it.ai]
+            use = [it for it in processed if it.ai and it.id < EX_ID0]
+            ex_done = [it for it in processed if it.ai and it.id >= EX_ID0]
             emit({"event": "stage", "stage": 2})
             self.ctx = {"scan": sc, "items": use, "root": root, "dest": dest, "model": model, "naming": naming, "wishes": wishes,
-                        "partial": stopped_early and len(use) < total, "rules": req.get("rules") or [],
+                        "partial": stopped_early and len(use) < len(items), "rules": req.get("rules") or [],
                         "projects_user": req.get("projects") or [], "learned": self.learned}
             clusters = cluster_items(use)
             self.ctx["clusters"] = clusters
+            if structure:
+                snodes = flatten_structure(structure)
+                self.ctx["snodes"] = snodes
+                # смысловые отпечатки всех файлов и примеров — по ним файлы узнают «свою» папку
+                need = [i for i in use + ex_done if i.vec is None and i.kind != "rule"]
+                if need:
+                    try:
+                        arr = embed([embed_text(i) for i in need])
+                        for i, v in zip(need, arr):
+                            i.vec = v
+                    except Exception:
+                        traceback.print_exc(file=sys.stderr)
+                by_path = {n.path.lower(): n for n in snodes}
+                for e in ex_done:
+                    n = by_path.get(ex_node.get(e.id, "").lower())
+                    if n is not None and e.vec is not None:
+                        n.ex_vecs.append(np.asarray(e.vec, dtype=np.float32))
+                        n.ex_desc.append(e.ai.get("description", ""))
+                emit({"event": "stage", "stage": 3})
+                self.ctx["assign"] = classify_structure(self.ctx, model)
+                mapping = {}
+                for cid, g in clusters.items():
+                    paths = Counter(self.ctx["assign"][i.id]["node"].path for i in g
+                                    if self.ctx["assign"].get(i.id, {}).get("node") is not None)
+                    mapping[cid] = paths.most_common(1)[0][0] if paths else MANUAL_RU
+                self.ctx["mapping"], self.ctx["mapping_base"], self.ctx["projects"] = mapping, dict(mapping), []
+                emit({"event": "plan", "plan": build_structure_plan(self.ctx, mapping, naming)})
+                return
             emit({"event": "stage", "stage": 3})
             mapping, projects = plan_mapping(model, wishes, clusters, naming, [p.get("name", "") for p in self.ctx["projects_user"]])
             self.ctx["mapping"] = mapping
@@ -835,7 +985,7 @@ class Engine:
         quick = quick_tune(req.get("text", ""), mapping, naming, ctx["clusters"])
         if quick:
             reply, mapping, naming = quick
-            plan = build_plan(ctx, mapping, naming)
+            plan = make_plan(ctx, mapping, naming)
             ctx["mapping"], ctx["naming"] = mapping, naming
             return {"reply": reply, "question": "", "options": [], "files": plan["files"], "mapping": mapping, "naming": naming}
         hist = req.get("history") or []
@@ -861,7 +1011,7 @@ class Engine:
         mw = out.get("max_words")
         if isinstance(mw, int) and mw >= 0:
             naming["maxWords"] = mw
-        plan = build_plan(ctx, mapping, naming)
+        plan = make_plan(ctx, mapping, naming)
         ctx["mapping"], ctx["naming"] = mapping, naming
         return {"reply": out.get("reply") or "Понял, поправил план.", "question": "", "options": [], "files": plan["files"], "mapping": mapping, "naming": naming}
 
@@ -1332,7 +1482,7 @@ def plan_mapping(model: str, wishes: str, clusters: dict[str, list[Item]], namin
                 part += "\n\nУже созданные папки (переиспользуй, если подходит): " + "; ".join(sorted(set(mapping.values()))[:80])
             if hint_line:
                 part = hint_line + "\n\n" + part
-            out, _ = ollama_chat(model, PLAN_PROMPT.format(wishes=wishes or "(не указаны — предложи разумную структуру)", langnote=langnote, groups=part), PLAN_SCHEMA)
+            out, _ = ollama_chat(model, PLAN_PROMPT.format(wishes=wishes or "(не указаны — предложи разумную структуру)", langnote=langnote, groups=part), PLAN_SCHEMA, temperature=0, seed=7)
             for a in out.get("assignments", []):
                 p = str(a.get("path", "")).strip().strip("/")
                 if p:
@@ -1390,6 +1540,13 @@ def tidy_path(path: str, it: Item, en: bool) -> str:
         if YEAR_NODATE.match(s):
             s = "No date" if en else "Без даты"
         segs.append(clean_name(s, 60))
+    # «Документы/Проекты/X/…» → «Проекты/X/…»: проекты всегда наверху; и не глубже трёх уровней
+    low = [s.lower() for s in segs]
+    for top in ("проекты", "projects"):
+        if top in low[1:]:
+            segs = segs[low.index(top, 1):]
+            break
+    segs = segs[:3]
     if not segs or any(s.lower() in MANUAL for s in segs):
         return "Sort manually" if en else "Разобрать вручную"
     if is_unreliable_photo(it) and segs[0] in ("Фото", "Photos"):
@@ -1400,6 +1557,8 @@ def tidy_path(path: str, it: Item, en: bool) -> str:
 
 # ───────────────────── правила, проекты и выученное: решают раньше модели ─────────────────────
 
+EX_ID0 = 10_000_000  # id файлов-примеров: они описываются вместе со всеми, но в план не попадают
+SIMILAR_SIM = 0.74  # «Разложить похожие» в плане: человек видит, что переехало, и может отменить — порог мягче
 LEARN_SIM = 0.80  # насколько файл должен быть похож на запомненный (bge-m3: чужие ~0.5–0.72, одно событие ~0.8+, копии ~0.97)
 WORD = "0-9a-zа-я"
 TYPE_RULE = {"photo": "Фото", "screenshot": "Скриншоты", "image": "Картинки", "doc": "Документы", "pdf": "PDF",
@@ -1633,7 +1792,7 @@ def build_plan(ctx: dict, mapping: dict[str, str], naming: dict) -> dict:
                 check = f"{len(g)} {plural(len(g), ('версия', 'версии', 'версий'))} одного файла — оставили последнюю сверху"
                 reason = f"Последняя из {len(g)} версий одного файла. Остальные {len(g) - 1} предлагаю убрать в «Старые версии». " + reason
             else:
-                path = path + "/Старые версии"
+                path = target.get(latest.id, path) + "/Старые версии"  # старые версии — рядом с последней
                 reason = f"Старая версия файла «{latest.path.name}» — убираем в «Старые версии»."
         if name_is_broken(it.path.name) and naming.get("rename", True):
             reason += " Испорченное имя — восстановили по содержимому."
@@ -1681,6 +1840,386 @@ def build_plan(ctx: dict, mapping: dict[str, str], naming: dict) -> dict:
     }
 
 
+# ───────────────────── режим «По моей структуре»: модель выбирает папку только из списка ─────────────────────
+
+S_FALLBACK = {"photo": ["img", "shot"], "shot": ["img", "photo"], "img": ["shot", "photo"], "scan": ["doc", "img", "shot", "photo"],
+              "html": ["doc"], "doc": ["html"]}
+S_TYPE_RU = {"photo": "фото", "shot": "скриншот", "img": "картинка", "scan": "скан документа", "video": "видео", "audio": "музыка",
+             "doc": "документ", "html": "html-страница", "inst": "установщик", "arch": "архив", "other": "файл"}
+S_MONTHS = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+S_MONTHS_EN = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+EX_SIM = 0.80  # насколько файл должен быть похож на примеры папки, чтобы лечь туда без модели
+
+
+@dataclass
+class SNode:
+    path: str
+    name: str
+    types: set
+    note: str
+    auto: str
+    names: str
+    depth: int
+    parent: "SNode | None" = None
+    kids: list = field(default_factory=list)
+    example_paths: list = field(default_factory=list)
+    ex_vecs: list = field(default_factory=list)
+    ex_desc: list = field(default_factory=list)
+
+
+def flatten_structure(tree: list[dict]) -> list[SNode]:
+    out: list[SNode] = []
+    seen: dict[str, SNode] = {}
+
+    def go(nodes, parent, prefix, depth):
+        for n in nodes or []:
+            raw = str(n.get("name") or "").strip()
+            if not raw:
+                continue
+            nm = clean_name(raw, 60)
+            p = f"{prefix}/{nm}" if prefix else nm
+            sn = seen.get(p.lower())
+            if sn is None:
+                sn = SNode(path=p, name=nm, types=set(n.get("types") or []), note=str(n.get("note") or "").strip(),
+                           auto=n.get("auto") or "none", names=n.get("names") or "smart", depth=depth, parent=parent)
+                seen[p.lower()] = sn
+                out.append(sn)
+                if parent:
+                    parent.kids.append(sn)
+            sn.example_paths += [str(x) for x in (n.get("examples") or []) if str(x).strip()]
+            go(n.get("kids"), sn, p, depth + 1)
+    go(tree, None, "", 0)
+    return out
+
+
+def stype(it: Item) -> str:
+    """Тип файла в терминах структуры: inst, arch, video, audio, html, doc, scan, photo, shot, img, other."""
+    if it.kind == "rule":
+        return {"installers": "inst", "archives": "arch"}.get(it.rule, "other")
+    if it.kind in ("video", "audio"):
+        return it.kind
+    if it.kind == "doc":
+        return "html" if it.ext in (".html", ".htm") else "doc"
+    k = it.ai.get("kind")
+    if it.ai.get("sensitive") or k in ("скан документа", "личный документ"):
+        return "scan"
+    if k == "фото":
+        return "photo"
+    if k == "скриншот":
+        return "shot"
+    return "img"
+
+
+def s_candidates(t: str, nodes: list[SNode]) -> tuple[list[SNode], list[SNode]]:
+    """(самые глубокие подходящие папки, все подходящие). Папки без типа подходят по смыслу — их выбирает модель."""
+    typed = [n for n in nodes if t in n.types]
+    if not typed:
+        for fb in S_FALLBACK.get(t, []):
+            typed = [n for n in nodes if fb in n.types]
+            if typed:
+                break
+    if t in ("inst", "arch", "other"):
+        pool = typed  # установщики, архивы и непонятные файлы — только в папку своего типа, «по смыслу» их не раскладываем
+    elif typed:
+        pool = typed + [n for n in nodes if not n.types and (n.note or n.ex_vecs)]
+    else:
+        pool = [n for n in nodes if not n.types]
+    paths = [n.path for n in pool]
+    leafy = [n for n in pool if not any(q != n.path and q.startswith(n.path + "/") for q in paths)]
+    return leafy, pool
+
+
+def s_by_examples(it: Item, cands: list[SNode]) -> tuple[SNode, float] | None:
+    if it.vec is None:
+        return None
+    scored = []
+    for n in cands:
+        if n.ex_vecs:
+            scored.append((max(float(np.dot(it.vec, v)) for v in n.ex_vecs), n))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: -x[0])
+    best, second = scored[0], (scored[1][0] if len(scored) > 1 else 0.0)
+    if best[0] >= EX_SIM and best[0] - second >= 0.03:
+        return best[1], best[0]
+    return None
+
+
+STRUCT_PROMPT = """Ты раскладываешь файлы по папкам пользователя. Придумывать новые папки нельзя — только выбрать одну из вариантов группы.
+Папки пользователя:
+{folders}
+
+Для КАЖДОЙ группы выбери одну папку из её вариантов — по смыслу файлов и пояснениям к папкам.
+Если ни один вариант не подходит по смыслу — ответь «нет».
+{groups}"""
+
+
+def s_folder_line(n: SNode) -> str:
+    bits = [n.path]
+    if n.note:
+        bits.append(f"пояснение: {n.note}")
+    if n.ex_desc:
+        bits.append("примеры: " + "; ".join(f"«{d[:90]}»" for d in n.ex_desc[:3]))
+    return "- " + " — ".join(bits)
+
+
+def classify_structure(ctx: dict, model: str) -> dict[int, dict]:
+    """Для каждого файла: папка из структуры (или «Разобрать вручную») и почему. Детерминированно, где можно; модель — только для выбора."""
+    nodes: list[SNode] = ctx["snodes"]
+    items: list[Item] = ctx["items"]
+    out: dict[int, dict] = {}
+    need: dict[tuple, list[Item]] = defaultdict(list)  # (тип, варианты) -> файлы, которым нужен выбор модели
+    for it in items:
+        t = stype(it)
+        leafy, pool = s_candidates(t, nodes)
+        if not pool:
+            out[it.id] = {"node": None, "src": "none", "why": f"Для типа «{S_TYPE_RU[t]}» в структуре нет папки."}
+            continue
+        if len(leafy) == 1 and leafy[0].types:
+            n = leafy[0]
+            out[it.id] = {"node": n, "src": "type", "why": f"{S_TYPE_RU[t].capitalize()} — по типу файла в «{n.name}»."}
+            continue
+        ex = s_by_examples(it, leafy)
+        if ex:
+            out[it.id] = {"node": ex[0], "src": "examples", "why": f"Похоже на примеры в «{ex[0].name}»."}
+            continue
+        need[(t, tuple(n.path for n in leafy))].append(it)
+
+    if need:
+        by_path = {n.path: n for n in nodes}
+        groups: list[tuple[str, str, list[Item], list[str]]] = []
+        gi = 0
+        for (t, cand_paths), its in need.items():
+            vec_its = [i for i in its if i.vec is not None]
+            if len(vec_its) == len(its) and len(its) > 1:
+                parts = semantic(its, np.stack([np.asarray(i.vec, dtype=np.float32) for i in its]), 0.2 if len(items) <= 80 else 0.28)
+            else:
+                parts = [[i] for i in its]
+            for g in parts:
+                gi += 1
+                groups.append((f"g{gi}", t, g, list(cand_paths)))
+        allowed = sorted({p for _, _, _, cp in groups for p in cp}) + ["нет"]
+        schema = {"type": "object", "properties": {"assignments": {"type": "array", "items": {"type": "object", "properties": {
+            "id": {"type": "string"}, "folder": {"type": "string", "enum": allowed}}, "required": ["id", "folder"]}}}, "required": ["assignments"]}
+        folder_lines = "\n".join(s_folder_line(n) for n in nodes)
+        answers: dict[str, str] = {}
+
+        def ask(chunk):
+            lines = []
+            for gid, t, g, cp in chunk:
+                tops = [x for x, _ in Counter((i.ai.get("topic") or "").lower() for i in g).most_common(3) if x]
+                descs = [i.ai.get("description", "")[:120] for i in g[:3]]
+                names = [i.path.name[:50] for i in g[:3]]
+                lines.append(f"- id={gid}; файлов={len(g)}; тип={S_TYPE_RU[t]}; темы={tops}; описания={descs}; имена={names}; варианты=[{' | '.join(cp)}]")
+            try:
+                res, _ = ollama_chat(model, STRUCT_PROMPT.format(folders=folder_lines, groups="\n".join(lines)), schema, temperature=0, seed=7)
+                for a in res.get("assignments") or []:
+                    answers[str(a.get("id"))] = str(a.get("folder") or "")
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+
+        for k in range(0, len(groups), 25):
+            ask(groups[k:k + 25])
+        missing = [g for g in groups if g[0] not in answers]
+        if missing:  # модель пропустила группы — спрашиваем ещё раз только про них
+            for k in range(0, len(missing), 12):
+                ask(missing[k:k + 12])
+        for gid, t, g, cp in groups:
+            ans = answers.get(gid, "")
+            cands = [by_path[p] for p in cp]
+            if ans in cp:
+                n = by_path[ans]
+                for i in g:
+                    out[i.id] = {"node": n, "src": "model", "why": f"Модель выбрала «{n.name}» из вашей структуры."}
+                continue
+            # ни один вариант не подошёл: самая глубокая общая папка-родитель того же типа, иначе — разобрать вручную
+            _, pool = s_candidates(t, nodes)
+            anc = [n for n in pool if n not in cands and any(c.path.startswith(n.path + "/") for c in cands)]
+            n = max(anc, key=lambda x: x.depth) if anc else None
+            for i in g:
+                out[i.id] = ({"node": n, "src": "parent", "why": f"Ни одна из подпапок не подошла — кладём в «{n.name}»."} if n
+                             else {"node": None, "src": "none", "why": "Ни одна папка вашей структуры не подошла."})
+
+    # версии одного файла — вместе, в папку последней версии
+    for _id, (g, latest) in version_groups(items).items():
+        a = out.get(latest.id)
+        if a and a.get("node") is not None:
+            for it in g:
+                if it.id != latest.id and out.get(it.id, {}).get("node") is not a["node"]:
+                    out[it.id] = {**a, "why": a["why"]}
+    return out
+
+
+def s_strip_tail(stem: str) -> str:
+    """Имя для всех версий: без даты и номера версии в конце — их добавим сами."""
+    s = DATE_TAIL.sub("", stem)
+    s = re.sub(r"[\s_\-—–]*(\(\d{1,3}\)|v\.?\d+([._]\d+)*|версия\s*\d+|копия|copy|final|финал|\d{1,2}\.\d{1,2}\.\d{2,4})\s*$", "", s, flags=re.I)
+    return s.strip(" -—–_.") or stem
+
+
+def s_project(it: Item, user_projects: list[dict], hints: list[tuple[str, int]]) -> str:
+    text = about_text(it)
+    for p in user_projects:
+        words = [p.get("name", "")] + list(p.get("keywords") or [])
+        if any(kw_hit(str(w), text) for w in words if str(w).strip()):
+            return str(p.get("name", "")).strip()
+    flat = it_text(it)
+    for name, _cnt in hints:
+        if norm_key(name) and norm_key(name) in flat:
+            return name
+    return ""
+
+
+def build_structure_plan(ctx: dict, mapping: dict[str, str], naming: dict) -> dict:
+    items: list[Item] = ctx["items"]
+    sc: Scan = ctx["scan"]
+    root: Path = ctx["root"]
+    dest: Path = ctx["dest"]
+    en = naming.get("lang") == "en"
+    snaming = {**naming, "rename": True}  # переименовывать или нет — решает каждая папка структуры
+    manual = "Sort manually" if en else MANUAL_RU
+    assign: dict[int, dict] = ctx["assign"]
+    base_map: dict[str, str] = ctx.get("mapping_base") or {}
+    nodes: list[SNode] = ctx["snodes"]
+    node_paths = [n.path for n in nodes]
+    # правила пользователя — как сказано; выученные примеры — только если их папка есть в структуре
+    learned = [e for e in ctx.get("learned") or [] if any(str(e.get("folder", "")) == p or str(e.get("folder", "")).startswith(p + "/") for p in node_paths)]
+    forced = overrides({**ctx, "projects_user": [], "learned": learned}, items, en)
+    users = ctx.get("projects_user") or []
+
+    # подпапки «по проектам»: названия, которые повторяются среди файлов этой папки
+    in_node: dict[str, list[Item]] = defaultdict(list)
+    for it in items:
+        a = assign.get(it.id) or {}
+        if a.get("node") is not None:
+            in_node[a["node"].path].append(it)
+    hints = {p: project_hints(its) for p, its in in_node.items() if any(n.path == p and n.auto == "projects" for n in nodes)}
+
+    versions = version_groups(items)
+    taken: set[str] = set()
+    files = []
+
+    def unique(folder: str, name: str) -> str:
+        stem, ext = os.path.splitext(name)
+        cand, k = name, 2
+        while f"{folder}/{cand}".lower() in taken:
+            cand = f"{stem} ({k}){ext}"
+            k += 1
+        taken.add(f"{folder}/{cand}".lower())
+        return cand
+
+    # имена версий: одно понятное имя на семейство + дата версии (и время, если за день версий несколько)
+    vname: dict[int, str] = {}
+    fams: dict[int, tuple[list[Item], Item]] = {}
+    for it_id, (g, latest) in versions.items():
+        fams[id(g)] = (g, latest)
+    for g, latest in fams.values():
+        base = clean_name(s_strip_tail(os.path.splitext(proposed_name(latest, {**snaming, "datePrefix": False}))[0]))
+        days = Counter(dt.datetime.fromtimestamp(i.mtime).strftime("%d.%m.%Y") for i in g)
+        for i in g:
+            d = dt.datetime.fromtimestamp(i.mtime)
+            day = d.strftime("%d.%m.%Y")
+            vname[i.id] = f"{base} {day}" + (f" {d.strftime('%H.%M')}" if days[day] > 1 else "") + i.ext
+
+    for it in sorted(items, key=lambda x: x.rel.lower()):
+        tp, icon, _c = type_of(it)
+        a = assign.get(it.id) or {"node": None, "src": "none", "why": "Ни одна папка вашей структуры не подошла."}
+        n: SNode | None = a.get("node")
+        fo = forced.get(it.id)
+        conf = {"type": 97, "examples": 90, "model": int(max(55, min(95, it.ai.get("confidence", 80) or 80))), "parent": 62}.get(a["src"], 30)
+        check = None
+        reason = (it.ai.get("description") or "").strip()
+        year = it.date[:4] if it.date and not is_unreliable_photo(it) else ""
+        nodate = "No date" if en else "Без даты"
+        if fo:
+            path = fo["path"].replace("{{year}}", year or nodate).replace("{year}", year or nodate)
+            reason = fo["why"] + (" " + reason if reason else "")
+            conf = max(conf, 97)
+            names = "keep" if fo["rename"] == "keep" else "smart"
+        elif n is None:
+            path = manual
+            reason = a["why"] + (" " + reason if reason else "")
+            check = "Не нашлось подходящей папки"
+            names = "keep"
+        else:
+            segs = [n.path]
+            if n.auto in ("years", "months"):
+                if is_unreliable_photo(it) or not it.date:
+                    segs.append(nodate)
+                else:
+                    segs.append(it.date[:4])
+                    if n.auto == "months":
+                        segs.append((S_MONTHS_EN if en else S_MONTHS)[int(it.date[5:7]) - 1])
+            elif n.auto == "projects":
+                pj = s_project(it, users, hints.get(n.path, []))
+                if pj:
+                    segs.append(clean_name(pj, 60))
+            path = "/".join(segs)
+            reason = a["why"] + (" " + reason if reason else "")
+            names = n.names
+            if a["src"] == "parent":
+                check = "Модель не уверена, в какую подпапку"
+        # «Дотюнить» поменял папку целой группы — слушаемся
+        cid = it.cluster
+        if cid and cid in mapping and mapping.get(cid) != base_map.get(cid) and not fo:
+            path = mapping[cid].strip().strip("/") or path
+            reason = "Перенесли по вашей просьбе в «Дотюнить». " + reason
+            check = None
+        if names == "keep":
+            name = it.path.name
+            if not fo and n is not None:
+                reason += f" Имя не меняем — так задано для папки «{n.name}»."
+        elif it.id in vname:
+            name = vname[it.id]
+            g, _ = versions[it.id]
+            reason += f" Одна из {len(g)} версий одного файла — в имени дата версии."
+        elif it.kind == "rule":
+            stem = re.sub(r"(?i)(setup|installer|install|x64|x86|win64|win32)", " ", it.path.stem)
+            stem = re.sub(r"([a-zа-я])([A-ZА-Я])", r"\1 \2", stem)
+            stem = clean_name(re.sub(r"[_\s]+", " ", stem).strip(" -_.")) or it.path.stem
+            name = (f"Установщик {stem}" if it.rule == "installers" else stem) + it.ext
+        else:
+            name = proposed_name(it, snaming)
+        if fo and fo["rename"] == "date" and names != "keep":
+            stem0 = os.path.splitext(name)[0]
+            name = (stem0 if stem0.startswith(it.date) else f"{it.date} {stem0}") + it.ext
+        if name_is_broken(it.path.name) and name != it.path.name:
+            reason += " Испорченное имя — восстановили по содержимому."
+        date_disp, dsrc = fmt_date(it.date), it.date_src
+        if it.meta.get("exif_reset") and it.date_src == "дата изменения":
+            d = it.meta["exif_reset"]
+            date_disp, dsrc = f"{d[8:10]}.{d[5:7]}.{d[:4]}?", "EXIF, ненадёжно"
+            check = check or "Дата ненадёжна: часы камеры были сброшены"
+        if it.kind in ("video", "audio") and not fo:
+            gb = it.size / 1024 ** 3
+            sz = f"{gb:.1f} ГБ" if gb >= 1 else f"{it.size / 1024 ** 2:.0f} МБ"
+            reason = reason + f" {'Видео' if it.kind == 'video' else 'Аудио'} {sz} — разобрано по имени и дате, без анализа содержимого."
+        name = unique(path, name)
+        files.append({
+            "id": it.id, "abs": str(it.path), "cur": str(it.path), "old": it.path.name, "fromRel": it.from_rel,
+            "name": name, "orig": name, "to": path, "engineTo": path, "type": tp, "icon": icon, "reason": reason.strip(),
+            "date": date_disp, "dsrc": dsrc, "conf": conf, "check": check, "priv": bool(it.ai.get("sensitive")),
+            "thumb": it.thumb, "kind": it.kind if it.kind != "rule" else "doc", "cluster": it.cluster, "size": it.size, "rejected": False,
+            "by": fo["src"] if fo else ("examples" if a["src"] == "examples" else None),
+        })
+    skipped = sum(sc.skipped_counts.values())
+    same = str(dest).rstrip("\\/").lower() == str(root).rstrip("\\/").lower()
+    return {
+        "root": str(root), "rootDisplay": display_name(root), "dest": str(dest), "destDisplay": display_name(root) if same else display_name(dest),
+        "files": files, "locked": [{k: v for k, v in l.items() if k != "cat"} for l in sc.locked], "skipped": skipped,
+        "projects": [], "rootFiles": sc.root_files, "rootKinds": sc.root_kinds,
+        "mapping": mapping, "naming": naming, "partial": bool(ctx.get("partial")),
+        "lockedDir": manual, "structure": True,
+    }
+
+
+MANUAL_RU = "Разобрать вручную"
+
+
+def make_plan(ctx: dict, mapping: dict[str, str], naming: dict) -> dict:
+    return build_structure_plan(ctx, mapping, naming) if ctx.get("snodes") is not None else build_plan(ctx, mapping, naming)
+
+
 # ───────────────────────────── цикл запросов ─────────────────────────────
 
 def main():
@@ -1701,7 +2240,7 @@ def main():
             if cmd == "ping":
                 res = {"pong": True}
             elif cmd == "scan":
-                res = scan_summary(scan(Path(req["root"]), set(req.get("unskip") or []), set(req.get("exclude") or [])))
+                res = scan_summary(scan(Path(req["root"]), set(req.get("unskip") or []), set(req.get("exclude") or []), req.get("structure") or None))
             elif cmd == "analyze":
                 if eng.job and eng.job.is_alive():
                     eng.stop.set()
@@ -1728,6 +2267,8 @@ def main():
                 res = eng.learned_info()
             elif cmd == "learned_reset":
                 res = eng.learned_reset()
+            elif cmd == "similar":
+                res = eng.similar(req)
             else:
                 raise RuntimeError(f"неизвестная команда {cmd}")
             emit({"id": rid, "ok": True, "result": res})

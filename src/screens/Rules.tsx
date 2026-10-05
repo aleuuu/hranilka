@@ -64,8 +64,8 @@ function Projects() {
       <Card>
         {list.map((p) => <ProjectRow key={p.id} p={p} last={false} />)}
         <div style={css("display:flex;align-items:center;gap:8px;padding:10px")}>
-          <Field value={name} onChange={setName} placeholder="Название, например Termoland" onEnter={() => add()} s="width:220px" />
-          <Field value={kw} onChange={setKw} placeholder="Ключевые слова через запятую: термоленд, аквапарк" onEnter={() => add()} s="flex:1" />
+          <Field value={name} onChange={setName} placeholder="Название, например Ремонт" onEnter={() => add()} s="width:220px" />
+          <Field value={kw} onChange={setKw} placeholder="Ключевые слова через запятую: смета, плитка" onEnter={() => add()} s="flex:1" />
           <Btn kind={name.trim() ? "primary" : "secondary"} icon="add" disabled={!name.trim()} onClick={() => add()}>Добавить</Btn>
         </div>
       </Card>

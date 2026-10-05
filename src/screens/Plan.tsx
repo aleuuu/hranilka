@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { C, Ic, css, topColor } from "../ui";
 import {
-  AppState, LOCKED_DIR, get, moveFile, planStats, rememberMove, rememberProjects, renameFile, restoreName, set, toggleReject, undoEdit, useApp,
+  AppState, LOCKED_DIR, MONTHS_RU, get, moveFile, moveSimilar, newPlanFolder, planStats, rememberMove, rememberProjects, renameFile, renameFolder,
+  restoreName, set, toggleReject, undoEdit, useApp,
 } from "../store";
 import type { FileItem } from "../lib/types";
 import { nf, plural, winJoin } from "../lib/format";
@@ -40,8 +41,27 @@ function linked(s: AppState) {
 type Row = {
   key: string; kind: "file" | "folder"; pad: number; icon: string; ic: string; fill: number; label: string; font: string; weight: number;
   c: string; bg: string; op: number; deco: string; tag?: string; tagC?: string; count?: number | null; outline: string;
-  onClick: () => void; fileId?: number; drop?: string | null; drag?: boolean;
+  onClick: () => void; fileId?: number; drop?: string | null; drag?: boolean; rename?: string; month?: boolean;
 };
+
+/** Поле переименования папки прямо в дереве: Enter — сохранить, Esc — отмена. */
+function RenameInput({ path, name }: { path: string; name: string }) {
+  const ref = useRef<HTMLInputElement>(null);
+  const done = useRef(false);
+  useEffect(() => { ref.current?.focus(); ref.current?.select(); }, []);
+  const finish = (save: boolean) => {
+    if (done.current) return;
+    done.current = true;
+    if (save) renameFolder(path, ref.current?.value || "");
+    else set({ planEdit: null });
+  };
+  return (
+    <input ref={ref} defaultValue={name} aria-label="Новое название папки" onClick={(e) => e.stopPropagation()} onMouseDown={(e) => e.stopPropagation()}
+      onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); finish(true); } else if (e.key === "Escape") finish(false); }}
+      onBlur={() => finish(true)}
+      style={css("flex:1;min-width:0;height:24px;border-radius:6px;border:1px solid #4a4a50;background:#141416;color:#ededee;font:500 13px 'Onest';padding:0 6px;outline:none")} />
+  );
+}
 
 export function Plan() {
   const s = useApp();
@@ -69,7 +89,7 @@ export function Plan() {
   useEffect(() => {
     if (!s.toast || s.toast.busy) return;
     const at = s.toast.at;
-    const tm = setTimeout(() => { if (get().toast?.at === at) set({ toast: null }); }, s.toast.learn != null ? 8000 : 4500);
+    const tm = setTimeout(() => { if (get().toast?.at === at) set({ toast: null }); }, s.toast.similar?.length ? 14000 : s.toast.learn != null ? 8000 : 4500);
     return () => clearTimeout(tm);
   }, [s.toast]);
 
@@ -111,13 +131,13 @@ export function Plan() {
       outline: "transparent", onClick: () => set({ sel: key }), fileId: f.id, drag: ns,
     };
   };
-  const folderRow = (key: string, label: string, pad: number, color: string, count: number | null, o: { icon?: string; tag?: string; linked?: boolean; drop?: string | null }): Row => {
+  const folderRow = (key: string, label: string, pad: number, color: string, count: number | null, o: { icon?: string; tag?: string; linked?: boolean; drop?: string | null; rename?: string; month?: boolean }): Row => {
     const isSel = s.sel === key, over = !!o.drop && s.dragOver === o.drop;
     return {
       key, kind: "folder", pad, icon: o.icon || "folder", ic: color, fill: 1, label, font: "Onest", weight: 500,
       c: isSel || o.linked ? "#f4f4f5" : "#d6d6d9", bg: over ? "oklch(0.74 0.15 300 / 0.14)" : isSel ? "#26262b" : o.linked ? "oklch(0.8 0.16 155 / 0.06)" : "transparent",
-      op: 1, deco: "none", tag: o.tag, tagC: "#6d6d73", count, outline: over ? "oklch(0.74 0.15 300 / 0.7)" : "transparent",
-      onClick: () => set({ sel: key }), drop: o.drop,
+      op: 1, deco: "none", tag: o.month ? "назовите событие" : o.tag, tagC: o.month ? "oklch(0.86 0.13 85)" : "#6d6d73", count, outline: over ? "oklch(0.74 0.15 300 / 0.7)" : "transparent",
+      onClick: () => set({ sel: key }), drop: o.drop, rename: o.rename, month: o.month,
     };
   };
 
@@ -139,6 +159,14 @@ export function Plan() {
   const tree = useMemo(() => {
     type Node = { path: string; name: string; kids: Map<string, Node>; files: FileItem[]; all: number };
     const root: Node = { path: "", name: "", kids: new Map(), files: [], all: 0 };
+    for (const p of s.planExtra) {  // новые папки, созданные в плане, — пока пустые
+      const parts = p.split("/").filter(Boolean);
+      let n = root;
+      parts.forEach((q, i) => {
+        if (!n.kids.has(q)) n.kids.set(q, { path: parts.slice(0, i + 1).join("/"), name: q, kids: new Map(), files: [], all: 0 });
+        n = n.kids.get(q)!;
+      });
+    }
     for (const f of s.files) {
       const parts = f.to.split("/").filter(Boolean);
       let n = root;
@@ -151,39 +179,45 @@ export function Plan() {
       n.files.push(f);
     }
     return root;
-  }, [s.files]);
+  }, [s.files, s.planExtra]);
   const visIds = new Set(vis.map((f) => f.id));
   const newRows: Row[] = [];
   const selIsN = (s.sel || "").startsWith("n:");
   const hasVis = (n: any): boolean => n.files.some((f: FileItem) => visIds.has(f.id)) || Array.from(n.kids.values()).some(hasVis);
+  // порядок верхних папок: как в своей структуре (если план по ней), иначе привычный
+  const topOrder = plan.structure ? s.tree.map((n) => n.name.trim()) : TOP_ORDER;
+  const lockedDir = plan.lockedDir || LOCKED_DIR;
   const walk = (n: any, depth: number) => {
     const kids = Array.from(n.kids.values()) as any[];
     kids.sort((a, b) => {
       if (depth === 0) {
-        const ia = LAST.includes(a.name) ? 99 : TOP_ORDER.indexOf(a.name) < 0 ? 50 : TOP_ORDER.indexOf(a.name);
-        const ib = LAST.includes(b.name) ? 99 : TOP_ORDER.indexOf(b.name) < 0 ? 50 : TOP_ORDER.indexOf(b.name);
+        const ia = LAST.includes(a.name) ? 99 : topOrder.indexOf(a.name) < 0 ? 50 : topOrder.indexOf(a.name);
+        const ib = LAST.includes(b.name) ? 99 : topOrder.indexOf(b.name) < 0 ? 50 : topOrder.indexOf(b.name);
         if (ia !== ib) return ia - ib;
       }
+      const ma = MONTHS_RU.indexOf(a.name), mb = MONTHS_RU.indexOf(b.name);
+      if (ma >= 0 && mb >= 0) return ma - mb;
       return a.name.localeCompare(b.name, "ru", { numeric: true });
     });
     for (const k of kids) {
       if (fl !== "all" && !hasVis(k)) continue;
       const lk = depth === 0 ? L.nf.has(k.path) && !selIsN : L.nf.has(k.path) && s.sel !== "n:" + k.path;
-      newRows.push(folderRow("n:" + k.path, k.name, 8 + depth * 18, topColor(k.path), k.all, { linked: lk, drop: k.path }));
+      const month = depth > 0 && MONTHS_RU.includes(k.name) && /^\d{4}$/.test(n.name);
+      newRows.push(folderRow("n:" + k.path, k.name, 8 + depth * 18, topColor(k.path), k.all, { linked: lk, drop: k.path, rename: k.path === lockedDir ? undefined : k.path, month: month && s.monthHint }));
       walk(k, depth + 1);
       k.files.filter((f: FileItem) => visIds.has(f.id)).forEach((f: FileItem) => newRows.push(fileRow(f, "n", 8 + (depth + 1) * 18)));
     }
   };
   walk(tree, 0);
   if (fl === "all" && plan.locked.length) {
-    newRows.push(folderRow("lock:all", "Целиком, без изменений", 8, "#6d6d73", null, { icon: "lock", tag: `${plan.locked.length} ${plural(plan.locked.length, ["папка", "папки", "папок"])}` }));
+    newRows.push(folderRow("lock:all", plan.structure ? `Целиком — в «${lockedDir}»` : "Целиком, без изменений", 8, "#6d6d73", null, { icon: "lock", tag: `${plan.locked.length} ${plural(plan.locked.length, ["папка", "папки", "папок"])}` }));
     plan.locked.forEach((l) => newRows.push(folderRow("lock:" + l.id, l.name, 26, "#5d5d63", null, { icon: "folder_special", tag: l.why })));
   }
 
   /* Карточка */
   const sel = s.sel || "";
   const sf = sel.startsWith("f:") ? s.files.find((f) => f.id === +sel.slice(2)) : null;
-  let fcard: { title: string; c: string; sub: string; locked: boolean; list: { label: string; n: string | number; c: string }[] } | null = null;
+  let fcard: { title: string; c: string; sub: string; locked: boolean; list: { label: string; n: string | number; c: string }[]; path?: string } | null = null;
   if (!sf && sel) {
     const k2 = sel.split(":").slice(1).join(":");
     if (sel.startsWith("o:")) {
@@ -196,10 +230,10 @@ export function Plan() {
       const fs = s.files.filter((f) => f.to === k2 || f.to.startsWith(k2 + "/"));
       const g: Record<string, number> = {};
       fs.forEach((f) => { const fr = f.fromRel || plan.rootDisplay; g[fr] = (g[fr] || 0) + 1; });
-      fcard = { title: k2.split("/").pop()!, c: topColor(k2), sub: `Новая папка · ${fs.length} ${plural(fs.length, ["файл", "файла", "файлов"])}`, locked: false, list: Object.entries(g).map(([fr, n2]) => ({ label: "из «" + fr + "»", n: n2, c: fr === plan.rootDisplay ? C.b : "#6d6d73" })) };
+      fcard = { title: k2.split("/").pop()!, c: topColor(k2), sub: `${s.planExtra.includes(k2) && !fs.length ? "Пустая папка — перетащите сюда файлы" : "Новая папка"} · ${fs.length} ${plural(fs.length, ["файл", "файла", "файлов"])}`, locked: false, list: Object.entries(g).map(([fr, n2]) => ({ label: "из «" + fr + "»", n: n2, c: fr === plan.rootDisplay ? C.b : "#6d6d73" })), path: k2 };
     } else {
       const l = plan.locked.find((x) => x.id === k2);
-      fcard = { title: l ? l.name : "Целиком, без изменений", c: "#8b8b90", sub: l ? "Причина: " + l.why : `Переедут в «${LOCKED_DIR}»`, locked: true, list: plan.locked.map((x) => ({ label: x.name, n: x.why, c: "#5d5d63" })) };
+      fcard = { title: l ? l.name : "Целиком, без изменений", c: "#8b8b90", sub: l ? "Причина: " + l.why : `Переедут в «${plan.lockedDir || LOCKED_DIR}»`, locked: true, list: plan.locked.map((x) => ({ label: x.name, n: x.why, c: "#5d5d63" })) };
     }
   }
   const histC = s.hist.length ? "#c9c9cd" : "#4d4d53";
@@ -210,8 +244,15 @@ export function Plan() {
       onMouseDown={row.drag && row.fileId != null ? (e) => { if (e.button === 0) dragRef.current = { id: row.fileId!, x: e.clientX, y: e.clientY, on: false }; } : undefined}
       style={css(`display:flex;align-items:center;gap:7px;height:30px;padding:0 8px 0 ${row.pad}px;border-radius:7px;background:${row.bg};outline:1px dashed ${row.outline};outline-offset:-1px;opacity:${row.op};cursor:${row.drag ? "grab" : "pointer"};transition:background .15s`)}>
       <Ic n={row.icon} s={`font-size:16px;color:${row.ic};font-variation-settings:'FILL' ${row.fill};flex:none`} />
-      <span style={css(`flex:1;min-width:0;font:${row.weight} ${side === "o" ? "12.5" : "13"}px '${row.font}',${side === "o" ? "monospace" : "sans-serif"};color:${row.c};text-decoration:${row.deco};white-space:nowrap;overflow:hidden;text-overflow:ellipsis`)}>{row.label}</span>
+      {row.rename && s.planEdit === row.rename ? <RenameInput path={row.rename} name={row.label} /> : (
+        <span onDoubleClick={row.rename ? (e) => { e.stopPropagation(); set({ planEdit: row.rename!, sel: row.key }); } : undefined}
+          style={css(`flex:1;min-width:0;font:${row.weight} ${side === "o" ? "12.5" : "13"}px '${row.font}',${side === "o" ? "monospace" : "sans-serif"};color:${row.c};text-decoration:${row.deco};white-space:nowrap;overflow:hidden;text-overflow:ellipsis`)}>{row.label}</span>
+      )}
       {row.tag && <span style={css(`display:inline-flex;align-items:center;gap:3px;font:400 ${side === "o" ? "10" : "10.5"}px 'Onest';color:${row.tagC};flex:none`)}>{row.tag}</span>}
+      {row.rename && s.planEdit !== row.rename && (
+        <button className="pen" title="Переименовать папку" onClick={(e) => { e.stopPropagation(); set({ planEdit: row.rename!, sel: row.key }); }}
+          style={css("width:22px;height:22px;border-radius:6px;border:none;background:none;color:#8b8b90;display:grid;place-items:center;padding:0;cursor:pointer;flex:none")}><Ic n="edit" s="font-size:15px" /></button>
+      )}
       {row.count != null && <span style={css("min-width:22px;height:18px;padding:0 5px;border-radius:5px;background:#1c1c1f;font:400 10.5px/18px 'JetBrains Mono',monospace;color:#8b8b90;text-align:center;flex:none")}>{nf(row.count)}</span>}
     </div>
   );
@@ -226,7 +267,7 @@ export function Plan() {
         <div style={css("display:flex;align-items:center;gap:6px;flex-wrap:wrap;font:400 13px 'Onest';color:#8b8b90")}>
           {B5(st.total)}{plural(st.total, ["файл", "файла", "файлов"])}<Ic n="arrow_forward" s="font-size:16px" />{B5(st.folders)}{plural(st.folders, ["папка", "папки", "папок"])}
           {dot}{B5(st.renamed)}переименуем
-          {st.locked > 0 && <>{dot}{B5(st.locked)}{plural(st.locked, ["проект", "проекта", "проектов"])} целиком</>}
+          {st.locked > 0 && <>{dot}{B5(st.locked)}{plan.structure ? plural(st.locked, ["папка", "папки", "папок"]) : plural(st.locked, ["проект", "проекта", "проектов"])} целиком</>}
           {dot}{B5(st.skipped)}не трогаем
           {st.check > 0 && <>{dot}<button onClick={() => set({ filter: "check" })} style={css("display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 8px;border-radius:6px;border:none;background:oklch(0.84 0.13 85 / 0.1);color:oklch(0.88 0.12 85);font:500 13px 'Onest';cursor:pointer")}>{nf(st.check)} стоит проверить</button></>}
           {st.rejected > 0 && <>{dot}<span style={css("color:#ededee")}>{st.rejected} {plural(st.rejected, ["отклонён", "отклонено", "отклонено"])}</span></>}
@@ -258,7 +299,16 @@ export function Plan() {
           <div style={css("flex:1;overflow:auto;padding:0 6px 12px")}>{oldRows.map((r) => renderRow(r, "o"))}</div>
         </div>
         <div style={css("border-right:1px solid #1c1c1f;display:flex;flex-direction:column;min-height:0;min-width:0")}>
-          <div style={css("height:36px;flex:none;display:flex;align-items:center;gap:8px;padding:0 14px;font:500 12px 'Onest';color:#8b8b90")}>Станет<span style={css("font:400 11px 'JetBrains Mono',monospace;color:#5d5d63")}>перетаскивайте файлы между папками</span></div>
+          <div style={css("height:36px;flex:none;display:flex;align-items:center;gap:8px;padding:0 8px 0 14px;font:500 12px 'Onest';color:#8b8b90")}>Станет<span style={css("font:400 11px 'JetBrains Mono',monospace;color:#5d5d63;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0")}>перетаскивайте файлы между папками</span>
+            <button onClick={newPlanFolder} style={css("margin-left:auto;height:26px;padding:0 9px;border-radius:7px;border:none;background:transparent;color:#9a9aa0;font:500 12px 'Onest';cursor:pointer;display:flex;align-items:center;gap:5px;flex:none")}><Ic n="create_new_folder" s="font-size:16px" />Новая папка</button>
+          </div>
+          {plan.structure && s.monthHint && s.files.some((f) => { const p = f.to.split("/"); return p.length >= 2 && MONTHS_RU.includes(p[p.length - 1]) && /^\d{4}$/.test(p[p.length - 2]); }) && (
+            <div style={css("margin:0 10px 8px;display:flex;align-items:center;gap:10px;padding:9px 10px 9px 12px;border-radius:10px;background:oklch(0.74 0.15 300 / 0.08);border:1px solid oklch(0.74 0.15 300 / 0.25)")}>
+              <Ic n="edit_calendar" s="font-size:18px;color:oklch(0.8 0.13 300)" />
+              <span style={css("flex:1;font:400 12px/1.35 'Onest';color:#d6d6d9")}>Видео разложены по месяцам. Назовите папки событиями: двойной клик по названию или карандаш.</span>
+              <button onClick={() => set({ monthHint: false })} style={css("height:26px;padding:0 9px;border-radius:6px;border:none;background:#1f1f23;color:#ededee;font:500 11px 'Onest';cursor:pointer")}>Понятно</button>
+            </div>
+          )}
           {s.projBanner && plan.projects.length > 0 && (
             <div style={css("margin:0 10px 8px;display:flex;align-items:center;gap:10px;padding:9px 10px 9px 12px;border-radius:10px;background:oklch(0.74 0.15 300 / 0.08);border:1px solid oklch(0.74 0.15 300 / 0.25)")}>
               <Ic n="workspaces" s="font-size:18px;color:oklch(0.8 0.13 300)" />
@@ -317,22 +367,31 @@ export function Plan() {
                   </div>
                 ))}
               </div>
-              {fcard.locked && <div style={css("display:flex;gap:8px;font:400 12px/1.45 'Onest';color:#9a9aa0")}><Ic n="lock" s="font-size:16px" />Перенесём целиком в «{LOCKED_DIR}», внутри ничего не тронем. Разобрать по файлам можно только явно.</div>}
+              {fcard.path && fcard.path !== lockedDir && (
+                <button onClick={() => set({ planEdit: fcard!.path! })} style={css("align-self:flex-start;height:30px;padding:0 11px;border-radius:7px;border:1px solid #2a2a2e;background:#18181b;color:#ededee;font:500 12px 'Onest';cursor:pointer;display:flex;align-items:center;gap:6px")}><Ic n="edit" s="font-size:15px" />Переименовать</button>
+              )}
+              {fcard.locked && <div style={css("display:flex;gap:8px;font:400 12px/1.45 'Onest';color:#9a9aa0")}><Ic n="lock" s="font-size:16px" />Перенесём целиком в «{plan.lockedDir || LOCKED_DIR}», внутри ничего не тронем. Разобрать по файлам можно только явно.</div>}
             </div>
           )}
         </div>
       </div>
       {s.toast && (
-        <div style={css("position:absolute;left:50%;bottom:20px;transform:translateX(-50%);display:flex;align-items:center;gap:12px;height:42px;padding:0 6px 0 14px;border-radius:11px;background:#1f1f22;border:1px solid #2e2e33;box-shadow:0 12px 40px rgba(0,0,0,.5);animation:pop .3s cubic-bezier(.2,.8,.2,1) both;white-space:nowrap;z-index:5")}>
+        <div style={css("position:absolute;left:0;right:0;bottom:20px;display:flex;justify-content:center;pointer-events:none;z-index:5")}><div style={css("position:relative;pointer-events:auto;display:flex;align-items:center;gap:12px;height:42px;padding:0 6px 0 14px;border-radius:11px;background:#1f1f22;border:1px solid #2e2e33;box-shadow:0 12px 40px rgba(0,0,0,.5);animation:pop .3s cubic-bezier(.2,.8,.2,1) both;white-space:nowrap;z-index:5")}>
           {s.toast.busy ? <span style={css("width:15px;height:15px;border-radius:50%;border:2px solid #3a3a3f;border-top-color:#ededee;animation:spin .8s linear infinite;flex:none")} /> : <Ic n="check" s="font-size:17px;color:oklch(0.85 0.14 155)" />}
           <span style={css("font:400 13px 'Onest';color:#ededee;max-width:520px;overflow:hidden;text-overflow:ellipsis")}>{s.toast.text}</span>
-          {s.toast.learn != null && (
+          {s.toast.learn != null && (s.toast.similar?.length ? (
+            <button onClick={() => moveSimilar(s.toast!.learn!)} title="Похожие файлы, которые вы ещё не трогали, — в эту же папку"
+              style={css("height:30px;padding:0 10px;border-radius:7px;border:none;background:oklch(0.72 0.15 155 / 0.18);color:oklch(0.9 0.1 155);font:500 12px 'Onest';cursor:pointer;display:flex;align-items:center;gap:5px")}>
+              <Ic n="auto_awesome" s="font-size:15px" />Разложить похожие · {s.toast.similar.length}
+            </button>
+          ) : (
             <button onClick={() => rememberMove(s.toast!.learn!)} title="Похожие файлы будут ложиться в эту папку сами — и сейчас, и в следующих сортировках"
               style={css("height:30px;padding:0 10px;border-radius:7px;border:none;background:oklch(0.72 0.15 155 / 0.18);color:oklch(0.9 0.1 155);font:500 12px 'Onest';cursor:pointer;display:flex;align-items:center;gap:5px")}>
               <Ic n="school" s="font-size:15px" />Запомнить
             </button>
-          )}
+          ))}
           {!s.toast.busy && <button onClick={undoEdit} style={css("height:30px;padding:0 10px;border-radius:7px;border:none;background:#2a2a2e;color:#ededee;font:500 12px 'Onest';cursor:pointer")}>Отменить</button>}
+        </div>
         </div>
       )}
       {ghost && (

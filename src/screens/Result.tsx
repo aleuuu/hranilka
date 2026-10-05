@@ -17,7 +17,8 @@ export function Result() {
   const live = s.files.filter((f) => !f.rejected);
   const tops = new Map<string, number>();
   live.forEach((f) => { const t = f.to.split("/")[0]; tops.set(t, (tops.get(t) || 0) + 1); });
-  plan.locked.forEach((l) => tops.set(LOCKED_DIR, (tops.get(LOCKED_DIR) || 0) + l.n));
+  const LD = plan.lockedDir || LOCKED_DIR;
+  plan.locked.forEach((l) => tops.set(LD, (tops.get(LD) || 0) + l.n));
   const allFolders = new Set<string>();
   live.forEach((f) => { const p = f.to.split("/"); for (let i = 1; i <= p.length; i++) allFolders.add(p.slice(0, i).join("/")); });
   const nFolders = allFolders.size + (plan.locked.length ? 1 : 0);
@@ -63,7 +64,7 @@ export function Result() {
             <span style={css("font:500 12px 'Onest';color:#8b8b90")}>Стало: {tops.size} {plural(tops.size, ["папка", "папки", "папок"])}</span>
             <div style={css("display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px 10px")}>
               {resFolders.map(([name, n], i) => {
-                const col = name === LOCKED_DIR ? "#8b8b90" : topColor(name);
+                const col = name === LD ? "#8b8b90" : topColor(name);
                 const gray = col.startsWith("#");
                 return (
                   <div key={name} style={css(`display:flex;flex-direction:column;align-items:center;gap:6px;animation:pop .45s cubic-bezier(.2,.8,.2,1) both;animation-delay:${200 + i * 70}ms`)}>

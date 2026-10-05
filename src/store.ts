@@ -2,15 +2,16 @@ import { useSyncExternalStore } from "react";
 import { api } from "./lib/api";
 import type {
   ApplyOp, ApplyResult, BootState, CurrentFile, FeedItem, FileItem, GpuState, LockedUnit, ModelKey, Naming,
-  PlanData, PullProgress, QuickFolder, ScanSummary, Screen, Settings, SysInfo, Theme, TuneMsg, UndoResult, WatchFolder,
+  PlanData, PullProgress, QuickFolder, ScanSummary, Screen, Settings, SNode, SysInfo, Theme, TuneMsg, UndoResult, WatchFolder,
 } from "./lib/types";
 import { FLOW, MODELS } from "./lib/types";
 import { localIso, plural } from "./lib/format";
-import { DEFAULT_THEME, applyTheme, watchSystem } from "./theme";
+import { DEFAULT_THEME, applyTheme, normalizeTheme } from "./theme";
+import { DEFAULT_PASTE, cloneTree, defaultTree, findIn, folderKey, nd, nodeFromName, parseList, toEngine, walkTree } from "./structure";
 
 export const DEFAULT_SETTINGS: Settings = {
   theme: DEFAULT_THEME, defRename: true, defDatePrefix: true, defLang: "ru", excludes: [], autoPauseGames: false, notifyDone: true,
-  watch: [], watchThreshold: 20, projects: [], rules: [],
+  watch: [], watchThreshold: 20, projects: [], rules: [], structures: {},
 };
 
 export const LOCKED_DIR = "Программы и проекты";
@@ -80,7 +81,7 @@ export interface AppState {
   view: "tree" | "grid";
   projBanner: boolean;
   privShown: Record<number, boolean>;
-  toast: { text: string; at: number; learn?: number; busy?: boolean } | null;
+  toast: { text: string; at: number; learn?: number; similar?: number[]; busy?: boolean } | null;
   dragOver: string | null;
   tuneOpen: boolean;
   msgs: TuneMsg[];
@@ -101,6 +102,18 @@ export interface AppState {
   planBadge: boolean;      // план готов, пока пользователь смотрел другую страницу
   rulesDirty: boolean;     // правила или проекты поменялись — при возврате к плану пересоберём его
   pullKey: ModelKey | null; // скачивание со страницы «Модели»
+  // своя структура
+  mode: "auto" | "mine";
+  tree: SNode[];
+  stSel: string | null;
+  stPanel: null | "paste" | "scan";
+  stPaste: string;
+  stScan: Record<string, boolean>;
+  undoT: { text: string; at: number; restore: () => void } | null;
+  // правки плана
+  planExtra: string[];     // новые пустые папки
+  planEdit: string | null; // папка, которую сейчас переименовывают
+  monthHint: boolean;
 }
 
 const emptyAn = (): AnState => ({
@@ -122,6 +135,8 @@ let state: AppState = {
   modal: null, prog: { n: 0, total: 0, lines: [] }, sessions: [], applyRes: null, stopN: 0, undoRes: null, undone: false,
   lockedDone: {},
   settings: DEFAULT_SETTINGS, flow: "start", planBadge: false, rulesDirty: false, pullKey: null,
+  mode: "auto", tree: defaultTree(), stSel: null, stPanel: null, stPaste: DEFAULT_PASTE, stScan: {}, undoT: null,
+  planExtra: [], planEdit: null, monthHint: true,
 };
 
 const subs = new Set<() => void>();
@@ -153,7 +168,7 @@ function parseSettings(raw: Record<string, unknown> | undefined): Settings {
   for (const k of Object.keys(DEFAULT_SETTINGS) as (keyof Settings)[]) {
     if (r[k] !== undefined && r[k] !== null && typeof r[k] === typeof DEFAULT_SETTINGS[k]) (out as any)[k] = r[k];
   }
-  out.theme = { ...DEFAULT_THEME, ...(out.theme || {}) };
+  out.theme = normalizeTheme(out.theme);
   return out;
 }
 
@@ -194,7 +209,6 @@ export async function bootApp() {
   const model = boot.model;
   const settings = parseSettings(boot.settings);
   applyTheme(settings.theme);
-  watchSystem(() => state.settings.theme);
   set({ boot, model, installed, secPerFile: boot.secPerFile, settings, rename: settings.defRename, datePrefix: settings.defDatePrefix, nameLang: settings.defLang });
   api.setKeepTray(settings.watch.some((w) => w.on)).catch(() => {});
   startWatcher();
@@ -290,7 +304,11 @@ export async function loadQuick() {
 const baseName = (p: string) => p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;
 
 export async function selectFolder(path: string, name?: string) {
-  set({ folder: path, folderName: name || baseName(path), scan: null, scanning: true, scanErr: null, skippedOpen: false, unskip: {} });
+  const saved = state.settings.structures[folderKey(path)];
+  set({
+    folder: path, folderName: name || baseName(path), scan: null, scanning: true, scanErr: null, skippedOpen: false, unskip: {},
+    stSel: null, stPanel: null, stScan: {}, ...(saved ? { tree: cloneTree(saved), mode: "mine" as const } : { tree: defaultTree() }),
+  });
   await rescan();
 }
 
@@ -322,7 +340,7 @@ export async function startAnalysis() {
   const naming: Naming = { rename: s.rename, datePrefix: s.datePrefix, lang: s.nameLang, maxWords: 0 };
   const dest = s.dest === "other" && s.destPath ? s.destPath : s.folder;
   const wish = s.wishes.trim();
-  if (wish) {
+  if (wish && s.mode === "auto") {
     const today = localIso();
     const rw = [{ text: wish, date: today }, ...(s.boot?.recentWishes || []).filter((w) => w.text !== wish)].slice(0, 5);
     set({ boot: s.boot ? { ...s.boot, recentWishes: rw } : s.boot });
@@ -333,9 +351,11 @@ export async function startAnalysis() {
   api.setBusy(true);
   api.gpuWatch(true);
   try {
+    const mine = s.mode === "mine";
+    if (mine) saveStructureNow();
     await api.analyze({
-      root: s.folder, dest, unskip: Object.keys(s.unskip).filter((k) => s.unskip[k]), wishes: wish, model: currentModel(), naming,
-      exclude: s.settings.excludes, rules: s.settings.rules, projects: s.settings.projects,
+      root: s.folder, dest: mine ? s.folder : dest, unskip: Object.keys(s.unskip).filter((k) => s.unskip[k]), wishes: mine ? "" : wish, model: currentModel(), naming,
+      exclude: s.settings.excludes, rules: s.settings.rules, projects: s.settings.projects, ...(mine ? { structure: toEngine(s.tree) } : null),
     });
   } catch (e: any) {
     set({ an: { ...state.an, error: String(e?.message || e) } });
@@ -412,7 +432,7 @@ function onPlan(plan: PlanData) {
   const files = plan.files.map((f) => ({ ...f, cur: f.cur || f.abs, engineTo: f.to, orig: f.name, rejected: false }));
   set({
     plan, files, hist: [], versions: [{ files, mapping: plan.mapping, naming: plan.naming }], verSel: 1,
-    sel: null, filter: "all", view: "tree", projBanner: plan.projects.length > 0, privShown: {}, toast: null,
+    sel: null, filter: "all", view: "tree", projBanner: plan.projects.length > 0, privShown: {}, toast: null, planExtra: [], planEdit: null, monthHint: true,
     msgs: [{ ai: true, text: "Напишите, что поправить. Пересчитаю только план — это секунды, а не час." }],
     tuneOpen: false, tuneBusy: false, sessions: [], applyRes: null, undoRes: null, undone: false, lockedDone: {},
     an: { ...state.an, stage: 4 },
@@ -446,9 +466,61 @@ export function toggleReject(id: number) {
 export function moveFile(id: number, to: string) {
   const f = state.files.find((x) => x.id === id);
   if (!f || f.to === to) { set({ dragOver: null }); return; }
+  const at = performance.now();
   commit(state.files.map((x) => (x.id === id ? { ...x, to, manualTo: to } : x)), {
-    dragOver: null, hist: pushHist(), toast: { text: "«" + f.name + "» → " + to.split("/").pop(), at: performance.now(), learn: id }, sel: "f:" + id,
+    dragOver: null, hist: pushHist(), toast: { text: "«" + f.name + "» → " + to.split("/").pop(), at, learn: id }, sel: "f:" + id,
   });
+  // похожие файлы, которые ещё не трогали руками, — предложим переложить туда же
+  api.similar(id).then((r) => {
+    const ids = r.ids.filter((x) => { const g = state.files.find((y) => y.id === x); return g && !g.manualTo && !g.rejected && g.to !== to; });
+    if (ids.length && state.toast?.at === at) set({ toast: { ...state.toast, similar: ids } });
+  }).catch(() => {});
+}
+
+/** «Разложить похожие»: похожие файлы — в ту же папку, и запоминаем это на будущее. */
+export function moveSimilar(id: number) {
+  const f = state.files.find((x) => x.id === id);
+  const ids = state.toast?.similar || [];
+  if (!f || !ids.length) return;
+  const folder = f.to;
+  const set_ = new Set(ids);
+  commit(state.files.map((x) => (set_.has(x.id) ? { ...x, to: folder, manualTo: folder, check: null, reason: "Похож на «" + f.name + "», который вы переложили сюда." } : x)), {
+    hist: pushHist(), toast: { text: `Ещё ${ids.length} ${plural(ids.length, ["похожий файл", "похожих файла", "похожих файлов"])} — в «${folder.split("/").pop()}». Запомню это и для следующих сортировок`, at: performance.now() },
+  });
+  api.learn([id], folder).catch(() => {});
+}
+
+/** Переименовать папку в плане (например, месяц — в событие). */
+export function renameFolder(path: string, value: string) {
+  const name = value.replace(/[\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim();
+  const segs = path.split("/");
+  const old = segs[segs.length - 1];
+  set({ planEdit: null });
+  if (!name || name === old) return;
+  segs[segs.length - 1] = name;
+  const np = segs.join("/");
+  const swap = (p: string) => (p === path ? np : p.startsWith(path + "/") ? np + p.slice(path.length) : p);
+  commit(state.files.map((f) => (f.to === path || f.to.startsWith(path + "/") ? { ...f, to: swap(f.to), manualTo: swap(f.to) } : f)), {
+    hist: pushHist(), planExtra: state.planExtra.map(swap), sel: state.sel === "n:" + path ? "n:" + np : state.sel,
+    monthHint: MONTHS_RU.includes(old) ? false : state.monthHint,
+    toast: { text: `Папка переименована: ${old} → ${name}`, at: performance.now() },
+  });
+}
+
+export const MONTHS_RU = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"];
+
+/** «Новая папка» в плане: внутри выбранной папки (или папки выбранного файла). */
+export function newPlanFolder() {
+  const sel = state.sel || "";
+  let base = sel.startsWith("n:") ? sel.slice(2) : "";
+  if (sel.startsWith("f:")) { const f = state.files.find((x) => x.id === +sel.slice(2)); if (f) base = f.to; }
+  const lockedDir = state.plan?.lockedDir || LOCKED_DIR;
+  if (base === lockedDir || base.startsWith(lockedDir + "/")) base = "";
+  const exists = (p: string) => state.planExtra.includes(p) || state.files.some((f) => f.to === p || f.to.startsWith(p + "/"));
+  let name = "Новая папка", k = 2;
+  while (exists((base ? base + "/" : "") + name)) name = "Новая папка " + k++;
+  const p = (base ? base + "/" : "") + name;
+  set({ planExtra: [...state.planExtra, p], sel: "n:" + p, planEdit: p });
 }
 
 /** Новый план от движка поверх текущего: ручные переносы, имена и отклонения пользователя сохраняются. */
@@ -594,7 +666,7 @@ export function buildOps(s: AppState = state): ApplyOp[] {
     ops.push({ kind: "file", id: "f" + f.id, src: f.cur, dstDir: dir, name: f.name });
   }
   for (const l of plan.locked) {
-    const dir = destDir(plan, LOCKED_DIR);
+    const dir = destDir(plan, plan.lockedDir || LOCKED_DIR);
     const cur = s.lockedDone[l.id] || l.cur;
     if (norm(cur) === norm(dir + "\\" + l.name)) continue;
     ops.push({ kind: "dir", id: l.id, src: cur, dstDir: dir, name: l.name });
@@ -607,7 +679,7 @@ export function planStats(s: AppState = state) {
   const live = files.filter((f) => !f.rejected);
   const folders = new Set<string>();
   live.forEach((f) => { const parts = f.to.split("/"); for (let i = 1; i <= parts.length; i++) folders.add(parts.slice(0, i).join("/")); });
-  if (s.plan?.locked.length) folders.add(LOCKED_DIR);
+  if (s.plan?.locked.length) folders.add(s.plan.lockedDir || LOCKED_DIR);
   return {
     total: files.length,
     folders: folders.size,
@@ -689,6 +761,100 @@ export async function startUndo(toScreen: Screen = "result") {
 export function newSort() {
   set({ plan: null, files: [], versions: [], hist: [], sessions: [], applyRes: null, undoRes: null, undone: false, sel: null, lockedDone: {} });
   go("start", { folder: null, folderName: null, scan: null });
+}
+
+/* ───────────────────────── своя структура ───────────────────────── */
+
+let stTimer: ReturnType<typeof setTimeout> | null = null;
+function saveStructureNow() {
+  if (stTimer) { clearTimeout(stTimer); stTimer = null; }
+  if (!state.folder) return;
+  saveSet({ structures: { ...state.settings.structures, [folderKey(state.folder)]: cloneTree(state.tree) } });
+}
+/** Каждая правка структуры запоминается для выбранной папки. */
+function setTree(tree: SNode[], extra?: Partial<AppState>) {
+  set({ tree, ...(extra || {}) });
+  if (stTimer) clearTimeout(stTimer);
+  stTimer = setTimeout(saveStructureNow, 500);
+}
+
+export function setMode(mode: "auto" | "mine") { set({ mode }); }
+
+export function stEdit(id: string, fn: (n: SNode) => void) {
+  const tr = cloneTree(state.tree);
+  const f = findIn(tr, id);
+  if (f) { fn(f.n); setTree(tr); }
+}
+export function stAddSub(id: string) {
+  const tr = cloneTree(state.tree);
+  const f = findIn(tr, id);
+  if (!f) return;
+  const k = nd("Новая папка", { types: f.n.types.slice(), names: f.n.names });
+  f.n.kids.push(k);
+  setTree(tr, { stSel: k.id });
+}
+export function stAddTop() {
+  const k = nd("Новая папка");
+  setTree([...cloneTree(state.tree), k], { stSel: k.id });
+}
+
+/** Удаление без вопросов, но с «Отменить» внизу. */
+export function withUndo(text: string, restore: () => void) {
+  set({ undoT: { text, at: performance.now(), restore } });
+}
+export function undoDestroy() {
+  const u = state.undoT;
+  if (!u) return;
+  set({ undoT: null });
+  u.restore();
+}
+export function stDelete(id: string) {
+  const prev = state.tree, prevSel = state.stSel;
+  const tr = cloneTree(prev);
+  const f = findIn(tr, id);
+  if (!f) return;
+  f.list.splice(f.i, 1);
+  setTree(tr, { stSel: state.stSel === id ? null : state.stSel });
+  withUndo("Папка «" + (f.n.name || "Без названия") + "» удалена" + (f.n.kids.length ? " вместе с подпапками" : ""), () => setTree(prev, { stSel: prevSel }));
+}
+export async function stAddExamples(id: string) {
+  const paths = await api.pickFiles(state.folder || undefined);
+  if (!paths.length) return;
+  stEdit(id, (n) => { for (const p of paths) if (!n.examples.includes(p)) n.examples.push(p); });
+}
+export function stRemoveExample(id: string, i: number) {
+  const prev = state.tree;
+  const f = findIn(prev, id);
+  const ex = f ? f.n.examples[i] : "";
+  stEdit(id, (n) => { n.examples.splice(i, 1); });
+  withUndo("Пример «" + (ex.split(/[\\/]/).pop() || ex) + "» убран", () => setTree(prev));
+}
+export function applyPaste() {
+  const tr = parseList(state.stPaste);
+  if (!tr.length) return false;
+  const prev = state.tree;
+  setTree(tr, { stPanel: null, stSel: null });
+  let c = 0;
+  walkTree(tr, () => c++);
+  withUndo(`Структура собрана из списка: ${c} ${plural(c, ["папка", "папки", "папок"])}`, () => setTree(prev));
+  return true;
+}
+/** «Взять из папки»: подпапки, которые уже есть, — в структуру, их файлы — примеры. */
+export function applyScan() {
+  const subs = state.scan?.subdirs || [];
+  const tr = cloneTree(state.tree);
+  let added = 0;
+  subs.forEach((x) => {
+    const on = state.stScan[x.name] ?? (x.kind !== "code" && x.kind !== "programs");
+    if (!on) return;
+    let hit: SNode | null = null;
+    walkTree(tr, (n) => { if (!hit && n.name.trim().toLowerCase() === x.name.toLowerCase()) hit = n; });
+    if (hit) (hit as SNode).fromFolder = x.n;
+    else tr.push(nodeFromName(x.name, x.n));
+    added++;
+  });
+  setTree(tr, { stPanel: null });
+  return added;
 }
 
 /* ───────────────────────── слежение за папками ───────────────────────── */

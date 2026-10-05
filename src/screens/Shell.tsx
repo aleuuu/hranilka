@@ -1,5 +1,12 @@
+import { useEffect } from "react";
 import { B, C, Ic, css } from "../ui";
-import { currentModel, go, goFlow, useApp } from "../store";
+import { currentModel, get, go, goFlow, set, undoDestroy, useApp } from "../store";
+import icFolder from "../assets/icons/folder.svg";
+import icRules from "../assets/icons/rules.svg";
+import icHistory from "../assets/icons/history.svg";
+import icModels from "../assets/icons/models.svg";
+import icSettings from "../assets/icons/settings.svg";
+import icWatch from "../assets/icons/watch.svg";
 import { FLOW, MODELS } from "../lib/types";
 import type { Screen } from "../lib/types";
 import { fmtSec, fmtShort } from "../lib/format";
@@ -15,13 +22,36 @@ import { Settings } from "./Settings";
 import { Watch } from "./Watch";
 
 const SIDE: [Screen, string, string][] = [
-  ["start", "folder_open", "Разобрать"],
-  ["rules", "rule_folder", "Правила"],
-  ["history", "history", "История"],
-  ["models", "memory", "Модели"],
-  ["settings", "settings", "Настройки"],
-  ["watch", "visibility", "Следить за папкой"],
+  ["start", icFolder, "Разобрать"],
+  ["rules", icRules, "Правила"],
+  ["history", icHistory, "История"],
+  ["models", icModels, "Модели"],
+  ["settings", icSettings, "Настройки"],
+  ["watch", icWatch, "Следить за папкой"],
 ];
+
+/** «Удалено — Отменить» внизу окна: удаление сразу, но с возможностью вернуть. */
+function UndoToast({ bottom }: { bottom: number }) {
+  const u = useApp().undoT;
+  useEffect(() => {
+    if (!u) return;
+    const at = u.at;
+    const tm = setTimeout(() => { if (get().undoT?.at === at) set({ undoT: null }); }, 6000);
+    return () => clearTimeout(tm);
+  }, [u]);
+  if (!u) return null;
+  return (
+    <div style={css(`position:absolute;left:0;right:0;bottom:${bottom}px;z-index:8;display:flex;justify-content:center;pointer-events:none`)}>
+    <div key={u.at} style={css("position:relative;pointer-events:auto;display:flex;align-items:center;gap:12px;min-height:44px;padding:6px 6px 6px 14px;border-radius:11px;background:#1f1f22;border:1px solid #2e2e33;box-shadow:0 12px 40px rgba(0,0,0,.5);white-space:nowrap;overflow:hidden;animation:pop .3s cubic-bezier(.2,.8,.2,1) both;max-width:calc(100% - 32px)")}>
+      <Ic n="delete" s="font-size:18px;color:#9a9aa0" />
+      <span style={css("font:400 13px 'Onest';color:#ededee;overflow:hidden;text-overflow:ellipsis")}>{u.text}</span>
+      <button onClick={undoDestroy} style={css("height:30px;padding:0 10px;border-radius:7px;border:none;background:#ededee;color:#0e0e0f;font:500 12px 'Onest';cursor:pointer;display:flex;align-items:center;gap:5px;flex:none")}><Ic n="undo" s="font-size:16px" />Отменить</button>
+      <B as="button" onClick={() => set({ undoT: null })} s="width:28px;height:28px;border-radius:7px;border:none;background:transparent;color:#6d6d73;cursor:pointer;display:grid;place-items:center;flex:none" h="color:#ededee"><Ic n="close" s="font-size:17px" /></B>
+      <span style={css("position:absolute;left:0;bottom:0;height:2px;width:100%;background:oklch(0.8 0.16 155 / 0.7);transform-origin:left;animation:undobar 6s linear both")} />
+    </div>
+    </div>
+  );
+}
 
 const HEAD: Record<string, [string, string]> = {
   start: ["folder_open", "Новая сортировка"], analysis: ["auto_awesome", "Анализ"], plan: ["account_tree", "План"], result: ["task_alt", "Результат"],
@@ -57,7 +87,7 @@ export function Shell() {
               onClick={() => { if (k === "start") { if (!inFlow) goFlow(); else if (sc !== "analysis" && sc !== "start") go("start"); } else go(k); }}
               s={`height:36px;flex:none;display:flex;align-items:center;gap:10px;padding:0 9px;border-radius:8px;border:1px solid ${a ? "#26262a" : "transparent"};background:${a ? "#18181b" : "transparent"};color:${a ? "#ededee" : "#9a9aa0"};font:400 14px 'Onest';cursor:pointer;white-space:nowrap;text-align:left;position:relative`}
               h="background:#18181b">
-              <Ic n={ic} s="font-size:19px;flex:none" />
+              <span style={{ ...css("width:20px;height:20px;flex:none;background:currentColor"), WebkitMask: `url("${ic}") center/contain no-repeat`, mask: `url("${ic}") center/contain no-repeat` }} />
               {wide && <span style={css("flex:1")}>{label}</span>}
               {wide && tag && <span style={css("font:400 11px 'JetBrains Mono',monospace;color:#6d6d73")}>{tag}</span>}
               {dot && <span style={css(`${wide ? "" : "position:absolute;top:7px;right:8px;"}width:7px;height:7px;border-radius:4px;background:oklch(0.8 0.16 155);flex:none;animation:glow 1.6s ease-in-out infinite`)} />}
@@ -134,6 +164,7 @@ export function Shell() {
         {sc === "settings" && <Settings />}
         {sc === "watch" && <Watch />}
         {s.tuneOpen && (sc === "plan" || sc === "result") && <TuneDrawer />}
+        <UndoToast bottom={sc === "start" || sc === "analysis" ? 82 : 20} />
       </div>
     </div>
   );

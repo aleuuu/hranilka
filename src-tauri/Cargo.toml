@@ -1,6 +1,6 @@
 [package]
 name = "hranilka"
-version = "0.2.0"
+version = "0.3.0"
 description = "Хранилка — наводит порядок в фото и документах с помощью локальной модели"
 authors = ["Хранилка"]
 edition = "2021"

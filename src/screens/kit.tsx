@@ -6,7 +6,7 @@ import { B, Ic, css } from "../ui";
 export function Page({ children, wide }: { children: React.ReactNode; wide?: boolean }) {
   return (
     <div style={css("flex:1;min-height:0;overflow:auto;animation:fadein .4s ease both")}>
-      <div style={css(`max-width:${wide ? 860 : 760}px;margin:0 auto;padding:22px 22px 40px;display:flex;flex-direction:column;gap:26px`)}>{children}</div>
+      <div style={css(`max-width:${wide ? 860 : 720}px;margin:0 auto;padding:26px 24px 40px;display:flex;flex-direction:column;gap:28px`)}>{children}</div>
     </div>
   );
 }
@@ -16,8 +16,8 @@ export function Section({ title, desc, right, children }: { title: string; desc?
     <section style={css("display:flex;flex-direction:column;gap:10px")}>
       <div style={css("display:flex;align-items:flex-end;gap:12px")}>
         <div style={css("flex:1;display:flex;flex-direction:column;gap:4px;min-width:0")}>
-          <span style={css("font:500 13px 'Onest';color:#8b8b90")}>{title}</span>
-          {desc && <span style={css("font:400 12.5px/1.45 'Onest';color:#6d6d73")}>{desc}</span>}
+          <span style={css("font:500 14px 'Onest';color:#d6d6d9")}>{title}</span>
+          {desc && <span style={css("font:400 13px/1.45 'Onest';color:#7a7a80")}>{desc}</span>}
         </div>
         {right}
       </div>
@@ -27,16 +27,16 @@ export function Section({ title, desc, right, children }: { title: string; desc?
 }
 
 export function Card({ children, s = "" }: { children: React.ReactNode; s?: string }) {
-  return <div style={css("border-radius:12px;border:1px solid #1f1f22;background:#111113;display:flex;flex-direction:column;overflow:hidden;" + s)}>{children}</div>;
+  return <div style={css("border-radius:12px;border:1px solid #222225;background:#1c1c1f;display:flex;flex-direction:column;gap:1px;overflow:hidden;" + s)}>{children}</div>;
 }
 
 export function Row({ label, desc, icon, children, last, onClick }: { label: React.ReactNode; desc?: React.ReactNode; icon?: string; children?: React.ReactNode; last?: boolean; onClick?: () => void }) {
   return (
-    <div onClick={onClick} style={css(`min-height:46px;display:flex;align-items:center;gap:12px;padding:9px 14px;border-bottom:1px solid ${last ? "transparent" : "#1a1a1d"};cursor:${onClick ? "pointer" : "default"}`)}>
+    <div onClick={onClick} style={css(`min-height:46px;display:flex;align-items:center;gap:12px;padding:12px 16px;background:#111113;cursor:${onClick ? "pointer" : "default"}${last ? "" : ""}`)}>
       {icon && <Ic n={icon} s="font-size:19px;color:#8b8b90;flex:none" />}
-      <div style={css("flex:1;min-width:0;display:flex;flex-direction:column;gap:2px")}>
-        <span style={css("font:400 13px 'Onest';color:#d6d6d9")}>{label}</span>
-        {desc && <span style={css("font:400 12px/1.4 'Onest';color:#6d6d73")}>{desc}</span>}
+      <div style={css("flex:1;min-width:0;display:flex;flex-direction:column;gap:3px")}>
+        <span style={css("font:500 14px 'Onest';color:#ededee")}>{label}</span>
+        {desc && <span style={css("font:400 12px/1.4 'Onest';color:#7a7a80")}>{desc}</span>}
       </div>
       {children}
     </div>

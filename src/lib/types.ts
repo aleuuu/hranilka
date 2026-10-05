@@ -44,8 +44,23 @@ export interface Rule { id: string; field: RuleField; value: string; folder: str
 
 export interface WatchFolder { path: string; name: string; on: boolean; since: number; count: number; examples: string[]; exists: boolean; notified: number }
 
+/* ── своя структура папок: модель выбирает папку только из неё ── */
+export type SType = "photo" | "shot" | "img" | "video" | "audio" | "doc" | "html" | "inst" | "arch";
+export type SAuto = "none" | "years" | "months" | "projects";
+export interface SNode {
+  id: string;
+  name: string;
+  types: SType[];
+  note: string;
+  examples: string[];   // пути к файлам-примерам
+  fromFolder: number;   // сколько файлов уже лежит в такой папке — они тоже примеры
+  names: "keep" | "smart";
+  auto: SAuto;
+  kids: SNode[];
+}
+
 export interface Settings {
-  theme: { mode: "system" | "light" | "dark" | "custom"; base: "graphite" | "midnight" | "oled" | "light"; accent: "green" | "blue" | "purple" | "orange" | "cyan" | "red" };
+  theme: { mode: "light" | "dark" };
   defRename: boolean;
   defDatePrefix: boolean;
   defLang: "ru" | "en";
@@ -56,6 +71,7 @@ export interface Settings {
   watchThreshold: number;
   projects: Project[];
   rules: Rule[];
+  structures: Record<string, SNode[]>;  // своя структура для каждой папки (ключ — путь в нижнем регистре)
 }
 
 export interface ModelsInfo {
@@ -82,6 +98,10 @@ export interface ScanSummary {
   lockedCount: number;
   skippedFiles: number;
   skipped: SkipCat[];
+  breakdown?: { html: number; instArch: number; docs: number; media: number; images: number; other: number };
+  allFiles?: number;
+  partial?: number;
+  subdirs?: { name: string; n: number; kind: "code" | "programs" | "userdirs" | "target" }[];
 }
 
 export interface Naming { rename: boolean; datePrefix: boolean; lang: "ru" | "en"; maxWords: number }
@@ -111,7 +131,7 @@ export interface FileItem {
   cluster: string;
   size: number;
   rejected: boolean;
-  by?: "rule" | "project" | "learned" | null; // кто решил, куда класть: ваше правило, ваш проект, выученный пример
+  by?: "rule" | "project" | "learned" | "examples" | null; // кто решил, куда класть: ваше правило, ваш проект, выученный пример
 }
 
 export interface LockedUnit { id: string; name: string; why: string; rel: string; abs: string; n: number; cur: string }
@@ -130,6 +150,8 @@ export interface PlanData {
   mapping: Record<string, string>;
   naming: Naming;
   partial: boolean;
+  lockedDir?: string;   // куда уходят папки целиком: «Программы и проекты» или «Разобрать вручную»
+  structure?: boolean;  // план собран по своей структуре
 }
 
 export interface AnalyzeOptions {
@@ -142,7 +164,11 @@ export interface AnalyzeOptions {
   exclude: string[];
   rules: Rule[];
   projects: Project[];
+  structure?: EngineNode[];
 }
+
+/** Узел структуры в том виде, в каком его ждёт движок. */
+export interface EngineNode { name: string; types: SType[]; note: string; examples: string[]; names: "keep" | "smart"; auto: SAuto; kids: EngineNode[] }
 
 export interface FeedItem { id: number; icon: string; c: string; old: string; name: string }
 export interface CurrentFile { id: number; old: string; thumb: string | null; thumbLabel: string; kind: string; desc: string; topic: string; name: string }

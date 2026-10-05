@@ -80,10 +80,11 @@ export function Models() {
                 <div style={css("display:flex;align-items:center;gap:10px")}>
                   <Ic n={ABOUT[k][0]} s="width:38px;height:38px;border-radius:10px;background:#1b1b1e;display:grid;place-items:center;font-size:20px;color:#c9c9cd;flex:none" />
                   <div style={css("flex:1;min-width:0;display:flex;flex-direction:column;gap:2px")}>
-                    <span style={css("font:500 15px 'Onest';color:#ededee;display:flex;align-items:center;gap:8px")}>
-                      {m.name}{rec === k && <span style={css("height:20px;padding:0 7px;border-radius:6px;background:#1f1f22;font:500 11px/20px 'Onest';color:#9a9aa0")}>для этого ПК</span>}
-                    </span>
-                    <span style={css("font:400 11.5px 'JetBrains Mono',monospace;color:#6d6d73")}>{m.llm}</span>
+                    <span style={css("font:500 16px 'Onest';color:#ededee")}>{m.name}</span>
+                    <div style={css("display:flex;align-items:center;gap:8px;flex-wrap:wrap")}>
+                      <span style={css("font:400 12px 'JetBrains Mono',monospace;color:#6d6d73")}>{m.llm}</span>
+                      {rec === k && <span style={css("height:18px;padding:0 6px;border-radius:5px;background:#1f1f22;font:400 11px 'Onest';color:#9a9aa0;display:inline-flex;align-items:center;white-space:nowrap;flex:none")}>для этого ПК</span>}
+                    </div>
                   </div>
                   {used ? (
                     <span style={css("display:flex;align-items:center;gap:6px;height:24px;padding:0 9px;border-radius:12px;background:oklch(0.72 0.15 155 / 0.12);font:500 12px 'Onest';color:oklch(0.85 0.12 155)")}><Ic n="check" s="font-size:15px" />Используется</span>

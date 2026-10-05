@@ -177,6 +177,8 @@ export function mockApi(): Api {
       return { restored: 11, total: 14, conflicts: [{ icon: "edit", name: "Klutz — экран оплаты.png", why: "переименован вручную" }, { icon: "drive_file_move", name: "Договор аренды — сен 2026.pdf", why: "перемещён в «Документы»" }, { icon: "delete", name: "Озеро, закат.jpg", why: "удалён" }] };
     },
     learn: async () => { await sleep(400); return { count: 1 }; },
+    similar: async () => ({ ids: [] }),
+    pickFiles: async () => ["C:\\Users\\Митя\\Загрузки\\мем-пятница.png"],
     replan: async () => ({ files: JSON.parse(JSON.stringify(files)), projects: plan.projects }),
     learnedInfo: async () => ({ count: 3, folders: [{ folder: "Проекты/Klutz", n: 2 }, { folder: "Документы/Финансы", n: 1 }] }),
     learnedReset: async () => ({ count: 0 }),
